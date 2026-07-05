@@ -1,0 +1,10 @@
+{
+  "kloc": 1,
+  "api": 5,
+  "camel_route": 3,
+  "kafka_topic": 2,
+  "db_table": 2,
+  "deployment": 2,
+  "module": 4,
+  "complexity": 10
+}
