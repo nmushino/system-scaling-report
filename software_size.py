@@ -11,6 +11,7 @@ Usage:
     python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effort]
                               [--productivity FILE] [--html FILE]
                               [--ai] [--ai-since WHEN] [--ai-metrics FILE]
+                              [--assess] [--assessment FILE]
 
     PATH                Directory to scan (default: current directory)
     --name NAME         Project name shown in the report (default: dir name)
@@ -37,6 +38,13 @@ Usage:
                          If the file sets "ai_productivity_factor", it is
                          applied to Base PM (see Notes) whether or not --ai
                          is also passed.
+    --assess             Add an Overall Assessment scorecard: letter grades
+                         for Maintainability/Architecture/Cloud Native/
+                         Documentation, an AI Readiness score, and a weighted
+                         Overall Score. A heuristic scorecard, kept separate
+                         from Base PM/APF -- it never affects the estimate.
+    --assessment FILE    JSON overriding the default category weights for
+                         --assess (see assessment.json).
 
 Notes:
     - Person-months are estimated from a size-banded SLOC-productivity table
@@ -60,6 +68,12 @@ Notes:
       "AI Generated Code %", "Copilot Accept Rate", "Prompt Count" or
       "Review Time" -- those need telemetry from your AI coding tool, which
       you supply via --ai-metrics.
+    - --assess is a third, independent model: a heuristic quality/maturity
+      scorecard (Maintainability, Architecture, Cloud Native, Documentation,
+      AI Readiness -> Overall Score). Every per-category rubric is a simple,
+      documented checklist (see README), not a certified audit, and it never
+      feeds into Base PM/APF -- estimation and diagnosis stay separate so the
+      PM figure remains reproducible and explainable.
     - Uses `cloc` for SLOC counting when available (accurate comment/blank
       stripping across languages), otherwise falls back to a built-in
       counter.
@@ -694,6 +708,216 @@ def render_ai_section(git_stats, external_metrics, external_source):
 
 
 # ---------------------------------------------------------------------------
+# Overall Assessment (opt-in via --assess): a heuristic scorecard, separate
+# from both the estimation model (Base PM) and the AI diagnostic (--ai).
+# Every threshold below is a judgment call, spelled out here and in the
+# README so it's auditable -- category *weights* are externalized to
+# assessment.json (--assessment FILE) so they can be rebalanced; the
+# per-category rubrics themselves are simple, documented checklists rather
+# than fine-grained formulas, to avoid implying more precision than the
+# underlying regex-based metrics actually support.
+# ---------------------------------------------------------------------------
+
+DEFAULT_ASSESSMENT_WEIGHTS = {
+    "maintainability": 35,
+    "architecture": 25,
+    "cloud_native": 15,
+    "documentation": 15,
+    "ai_readiness": 10,
+}
+
+# (lower bound inclusive, letter) -- a conventional academic-style curve,
+# not something invented for this tool.
+GRADE_BANDS = [
+    (97, "A+"), (93, "A"), (90, "A-"),
+    (87, "B+"), (83, "B"), (80, "B-"),
+    (77, "C+"), (73, "C"), (70, "C-"),
+    (60, "D"), (0, "F"),
+]
+
+
+def load_assessment_weights(path):
+    weights = dict(DEFAULT_ASSESSMENT_WEIGHTS)
+    if path:
+        with open(path) as f:
+            weights.update(json.load(f))
+    return weights
+
+
+def score_to_grade(score):
+    if score is None:
+        return "N/A"
+    for lower, grade in GRADE_BANDS:
+        if score >= lower:
+            return grade
+    return "F"
+
+
+def score_maintainability(metrics):
+    """Average CC (lower is better) + test Coverage, averaged if both known.
+
+    Maximum CC is deliberately excluded: this tool's brace-matching CC
+    heuristic can spike on minified/vendored front-end bundles that aren't
+    real hand-written functions, so a single outlier shouldn't dominate the
+    grade (Maximum CC is still shown elsewhere for reference).
+    """
+    avg_cc = metrics.get("avg_cc")
+    if avg_cc is None:
+        cc_score = None
+    elif avg_cc <= 5:
+        cc_score = 100
+    elif avg_cc <= 8:
+        cc_score = 90
+    elif avg_cc <= 12:
+        cc_score = 75
+    elif avg_cc <= 20:
+        cc_score = 55
+    else:
+        cc_score = 35
+    coverage = metrics.get("coverage")
+    cov_score = coverage if coverage is not None else None
+    parts = [p for p in (cc_score, cov_score) if p is not None]
+    return round(sum(parts) / len(parts)) if parts else None
+
+
+def score_architecture(metrics):
+    """Checklist: decomposition (Modules/Microservices) + contract coverage
+    (any OpenAPI/AsyncAPI spec at all). Not a ratio of specs-to-endpoints,
+    since one spec file commonly documents many endpoints -- comparing file
+    counts to endpoint counts would be comparing mismatched units.
+    """
+    score = 50
+    if metrics["modules"] >= 2:
+        score += 15
+    if metrics["microservices"] >= 2:
+        score += 15
+    if metrics["openapi_specs"] > 0:
+        score += 10
+    if metrics["asyncapi_specs"] > 0:
+        score += 10
+    return min(score, 100)
+
+
+def score_cloud_native(metrics):
+    """Checklist: any Deployment manifests, Helm packaging, StatefulSet/
+    CronJob usage beyond basic Deployments, and rough Deployment-to-
+    microservice coverage (are most services actually manifested?).
+    """
+    score = 40
+    if metrics["deployments"] > 0:
+        score += 20
+    if metrics["helm_charts"] > 0:
+        score += 15
+    if metrics["statefulsets"] > 0 or metrics["cronjobs"] > 0:
+        score += 10
+    if metrics["microservices"] > 0 and metrics["deployments"] >= metrics["microservices"] * 0.5:
+        score += 15
+    return min(score, 100)
+
+
+def score_documentation(metrics):
+    """Markdown SLOC as a fraction of Total SLOC (doc density), plus a small
+    bonus if any OpenAPI/AsyncAPI spec exists (documented interfaces).
+    Vendored Markdown (e.g. an upstream project's CHANGELOGs) inflates this
+    just like it inflates SLOC -- see "使う上での注意点" in the README.
+    """
+    total = metrics["total_sloc"]
+    md = metrics["sloc_by_lang"].get("Markdown", 0)
+    ratio = (md / total) if total else 0
+    if ratio >= 0.08:
+        score = 100
+    elif ratio >= 0.04:
+        score = 85
+    elif ratio >= 0.02:
+        score = 70
+    elif ratio >= 0.005:
+        score = 55
+    else:
+        score = 35
+    if metrics["openapi_specs"] > 0 or metrics["asyncapi_specs"] > 0:
+        score = min(score + 10, 100)
+    return score
+
+
+def score_ai_readiness(ai_stats, ai_external):
+    """Blends the git-derived AI-coauthored-commit ratio (--ai) with
+    externally-supplied AI metrics (--ai-metrics), when available. Returns
+    None (shown as N/A, excluded from Overall Score) if neither is present --
+    this tool does not guess AI involvement without at least one real signal.
+    """
+    components = []
+    if ai_stats and ai_stats.get("commit_count"):
+        ratio = ai_stats["ai_coauthored_commit_ratio_pct"]
+        components.append(min(40 + ratio * 0.6, 100))
+    if ai_external:
+        sub = []
+        if ai_external.get("ai_generated_ratio_pct") is not None:
+            sub.append(min(40 + ai_external["ai_generated_ratio_pct"] * 0.6, 100))
+        if ai_external.get("copilot_accept_rate_pct") is not None:
+            sub.append(ai_external["copilot_accept_rate_pct"])
+        flags = [ai_external.get(k) for k in
+                 ("ai_test_generation_used", "ai_review_used", "ai_refactoring_used")]
+        flags_present = [f for f in flags if f is not None]
+        if flags_present:
+            sub.append(sum(70 if f else 30 for f in flags_present) / len(flags_present))
+        if sub:
+            components.append(sum(sub) / len(sub))
+    if not components:
+        return None
+    return round(sum(components) / len(components))
+
+
+def compute_assessment(metrics, classification, ai_stats, ai_external, weights):
+    subscores = {
+        "maintainability": score_maintainability(metrics),
+        "architecture": score_architecture(metrics),
+        "cloud_native": score_cloud_native(metrics),
+        "documentation": score_documentation(metrics),
+        "ai_readiness": score_ai_readiness(ai_stats, ai_external),
+    }
+    grades = {k: score_to_grade(v) for k, v in subscores.items()}
+    available = {k: v for k, v in subscores.items() if v is not None}
+    weight_sum = sum(weights[k] for k in available)
+    overall = round(sum(subscores[k] * weights[k] for k in available) / weight_sum) if weight_sum else None
+    return {
+        "project_size": classification,
+        "subscores": subscores,
+        "grades": grades,
+        "overall_score": overall,
+        "overall_grade": score_to_grade(overall),
+        "weights_used": weights,
+    }
+
+
+def render_assessment_section(assessment):
+    lines = []
+    add = lines.append
+    add("")
+    add("Overall Assessment (heuristic scorecard, --assess)")
+    add("-" * 60)
+    add(f"Project Size        : {assessment['project_size']}")
+    add("")
+    labels = {"maintainability": "Maintainability", "architecture": "Architecture",
+              "cloud_native": "Cloud Native", "documentation": "Documentation"}
+    for key, label in labels.items():
+        score = assessment["subscores"][key]
+        grade = assessment["grades"][key]
+        add(f"{label:<20}: {grade if score is not None else 'N/A'}"
+            + (f"  ({score}/100)" if score is not None else "  (insufficient data)"))
+    ai_score = assessment["subscores"]["ai_readiness"]
+    add(f"{'AI Readiness':<20}: {f'{ai_score}/100' if ai_score is not None else 'N/A (pass --ai and/or --ai-metrics)'}")
+    if assessment["overall_score"] is not None:
+        add(f"{'Overall Score':<20}: {assessment['overall_score']}/100 ({assessment['overall_grade']})")
+    else:
+        add(f"{'Overall Score':<20}: N/A (no category could be scored)")
+    add("* Heuristic scorecard for relative comparison, not a certified audit.")
+    add("  Category weights are in assessment.json (--assessment FILE); rubric")
+    add("  details are documented in README. Independent of Base PM/APF above --")
+    add("  this section never feeds into the effort estimate.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -772,7 +996,7 @@ def compute_score(metrics, weights):
 # ---------------------------------------------------------------------------
 
 def render_report(name, metrics, weights, score, classification, effort=None, productivity_source=None,
-                  ai_external=None):
+                  ai_external=None, assessment=None):
     """Renders the text report summary-first: headline Summary, then details."""
     lines = []
     add = lines.append
@@ -786,6 +1010,8 @@ def render_report(name, metrics, weights, score, classification, effort=None, pr
     add(f"SLOC           : {metrics['total_sloc']:,}")
     add(f"Files          : {metrics['files']:,}")
     add("Size Bands     : Tiny(<100) / Small(100-300) / Medium(300-700) / Large(700-1500) / Enterprise(1500+)")
+    if assessment is not None:
+        lines.append(render_assessment_section(assessment))
     if effort is not None:
         add("")
         add(f"Effort Estimate (productivity: {productivity_source})")
@@ -947,7 +1173,7 @@ def _svg_gauge(score, bands, width=680):
 
 
 def render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source,
-                ai_stats=None, ai_external=None, ai_external_source=None, apf_context=None):
+                ai_stats=None, ai_external=None, ai_external_source=None, apf_context=None, assessment=None):
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     badge_colors = {"Tiny": "#60a5fa", "Small": "#3b82f6", "Medium": "#2563eb",
                     "Large": "#f59e0b", "Enterprise": "#ef4444"}
@@ -1070,6 +1296,41 @@ def render_html(name, metrics, weights, score, classification, breakdown, effort
     {ext_block}
   </div>"""
 
+    assessment_panel_html = ""
+    if assessment is not None:
+        grade_labels = {"maintainability": "Maintainability", "architecture": "Architecture",
+                        "cloud_native": "Cloud Native", "documentation": "Documentation"}
+        grade_cards = "".join(
+            stat_card(label, assessment["grades"][key],
+                      f"{assessment['subscores'][key]}/100" if assessment["subscores"][key] is not None
+                      else "insufficient data")
+            for key, label in grade_labels.items()
+        )
+        ai_score = assessment["subscores"]["ai_readiness"]
+        grade_cards += stat_card("AI Readiness",
+                                  f"{ai_score}/100" if ai_score is not None else "N/A",
+                                  "git/--ai-metrics based" if ai_score is not None else "pass --ai / --ai-metrics")
+        overall_card = stat_card(
+            "Overall Score",
+            f"{assessment['overall_score']}/100 ({assessment['overall_grade']})"
+            if assessment["overall_score"] is not None else "N/A",
+            "weighted heuristic scorecard", accent=True,
+        )
+        assessment_panel_html = f"""
+  <div class="panel">
+    <h2>Overall Assessment</h2>
+    <p class="note">Project Size: <strong>{_esc(assessment['project_size'])}</strong></p>
+    <div class="hero">
+      {overall_card}
+      {grade_cards}
+    </div>
+    <p class="note">
+      Heuristic scorecard for relative comparison, not a certified audit &mdash; rubric details and
+      category weights (assessment.json / --assessment) are documented in README. Independent of
+      Base PM/APF above; never feeds into the effort estimate.
+    </p>
+  </div>"""
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1121,6 +1382,7 @@ def render_html(name, metrics, weights, score, classification, breakdown, effort
     {stat_card("Effort: Node", f"{effort['node_person_months']} 人月", f"{effort['node_sloc']:,} SLOC (TS+JS)")}
     {stat_card("Effort: Total", f"{effort['total_person_months']} 人月", "Java + Node", accent=True)}
   </section>
+  {assessment_panel_html}
 
   <div class="panel">
     <h2>Size Classification</h2>
@@ -1243,6 +1505,12 @@ def main():
                                             "on a big repo can take a minute or more)")
     parser.add_argument("--ai-metrics", help="JSON file with externally-measured AI metrics "
                                               "(see ai-metrics.example.json); not estimated if omitted")
+    parser.add_argument("--assess", action="store_true",
+                         help="Add an Overall Assessment scorecard (Maintainability/Architecture/"
+                              "Cloud Native/Documentation/AI Readiness letter grades + Overall Score). "
+                              "A heuristic scorecard, independent of Base PM/APF -- see README.")
+    parser.add_argument("--assessment", help="JSON file overriding the default Overall Assessment "
+                                              "category weights (see assessment.json)")
     args = parser.parse_args()
 
     root = os.path.abspath(args.path)
@@ -1271,12 +1539,19 @@ def main():
     if ai_external and ai_external.get("ai_productivity_factor") is not None:
         effort = apply_ai_productivity_factor(effort, ai_external["ai_productivity_factor"], args.ai_metrics)
 
-    print(render_report(name, metrics, weights, score, classification,
-                        effort if args.effort else None, productivity_source, ai_external))
-
     ai_stats = None
     if args.ai:
         ai_stats = git_ai_stats(root, since=args.ai_since)
+
+    assessment = None
+    if args.assess:
+        assessment_weights = load_assessment_weights(args.assessment)
+        assessment = compute_assessment(metrics, classification, ai_stats, ai_external, assessment_weights)
+
+    print(render_report(name, metrics, weights, score, classification,
+                        effort if args.effort else None, productivity_source, ai_external, assessment))
+
+    if args.ai:
         print(render_ai_section(ai_stats, ai_external, args.ai_metrics))
 
     if args.html:
@@ -1287,7 +1562,8 @@ def main():
                             ai_stats=ai_stats if args.ai else None,
                             ai_external=ai_external if args.ai else None,
                             ai_external_source=args.ai_metrics,
-                            apf_context=ai_external)
+                            apf_context=ai_external,
+                            assessment=assessment)
         with open(args.html, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"\nHTML report written to {args.html}")
@@ -1299,6 +1575,7 @@ def main():
             "breakdown": breakdown, "score": score, "classification": classification,
             "effort": effort,
             "ai": {"git_stats": ai_stats, "external_metrics": ai_external} if (args.ai or ai_external) else None,
+            "assessment": assessment,
         }, indent=2, default=str))
 
 

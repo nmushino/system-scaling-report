@@ -15,7 +15,7 @@
 ```
 python3 software_size.py ../quarkusdroneshop-web --name quarkusdroneshop-web \
   --weights weights.json --effort --productivity productivity.json \
-  --ai --ai-since "90 days ago" --ai-metrics ai-metrics.example.json
+  --ai --ai-since "90 days ago" --ai-metrics ai-metrics.example.json --assess
 ```
 
 ### 1. Summary(最初に見る場所)
@@ -33,7 +33,28 @@ Size Bands     : Tiny(<100) / Small(100-300) / Medium(300-700) / Large(700-1500)
 - **Score / 分類**: `weights.json`の重みを各メトリクスの生値に掛けて合算した値(算出方法は「スコア算出とサイズ分類」章)。分類は下の`Size Bands`の帯のどこに入るかを示すだけで、それ以上の意味(良し悪し)は持たない。あくまで「相対的な規模感」の指標。
 - **SLOC / Files**: スキャン対象の総行数・総ファイル数。ベンダー取り込みコードを含むと過大になる点は「使う上での注意点」を参照。
 
-### 2. Effort Estimate(`--effort`指定時。契約・計画にはここだけ見ればよい)
+### 2. Overall Assessment(`--assess`指定時。あくまで診断用スコアカード)
+
+```
+Overall Assessment (heuristic scorecard, --assess)
+------------------------------------------------------------
+Project Size        : Small
+
+Maintainability     : A-  (90/100)
+Architecture        : F  (50/100)
+Cloud Native        : F  (40/100)
+Documentation       : C-  (70/100)
+AI Readiness        : 69/100
+Overall Score       : 67/100 (D)
+```
+
+- 5つのカテゴリ(Maintainability/Architecture/Cloud Native/Documentation/AI Readiness)をそれぞれ0-100点でスコアリングし、レター評価(A+〜F、一般的な学校の成績表と同じ換算)に変換したもの。各カテゴリの採点ルール(ルーブリック)は「Overall Assessment (--assess)」章に**全項目明記**しているので、なぜその評価になったかを追跡できる。
+- **Effort Estimate(人月)には一切影響しない**。ScoreやAI Readinessと同じく、あくまで規模・成熟度の相対比較用の診断情報。
+- カテゴリの重み付け(既定: Maintainability35% / Architecture25% / Cloud Native15% / Documentation15% / AI Readiness10%)は`assessment.json`に外部化されており、`--assessment FILE`で自社の判断に合わせて調整できる。
+- 該当データが無いカテゴリ(例: `--ai`も`--ai-metrics`も指定していない場合のAI Readiness)は`N/A`となり、Overall Scoreの計算からは除外(残りカテゴリの重みで再正規化)される。
+- この`quarkusdroneshop-web`の例でArchitecture/Cloud Nativeが`F`なのは、単にこのプロジェクトがMicroservices構成でもK8sマニフェストを持ってもいないため(ルーブリックの加点条件を満たしていないだけ)であり、「悪いコード」という意味ではない。
+
+### 3. Effort Estimate(`--effort`指定時。契約・計画にはここだけ見ればよい)
 
 ```
 Effort Estimate (productivity: productivity.json)
@@ -61,11 +82,11 @@ Effort Estimate (productivity: productivity.json)
 - `Estimated PM (AI-adjusted)`は「AIを使うと前提した場合の参考値」であり、**Base PMの代わりに使うかどうかは見積り側の判断**。ツールはどちらが正しいかを決めない。
 - `Basis`は、APFの値(0.82)を入力した人が何を根拠に判断したかの記録。ツールはこの根拠からAPFを計算していない(計算式にすると閾値の決め方が編集判断になるため、意図的にそうしていない)。数字の妥当性を後から確認するための情報。
 
-### 3. Project 〜 Dependencies(規模の内訳)
+### 4. Project 〜 Dependencies(規模の内訳)
 
 Score算出の元になった生の数値。「スコア算出とサイズ分類」の重み表と対応させて見ると、どの要素がScoreを押し上げているかが分かる(例: `Modules`が多い/`REST APIs`が多いプロジェクトほどAPI・Module項目の寄与が大きくなる)。各項目の集計方法は「計測項目」章を参照。`Complexity`の`Coverage`はjacoco.xml等が無ければ`N/A`(推測しない)。
 
-### 4. AI Development(`--ai`指定時。見積りには使わない診断情報)
+### 5. AI Development(`--ai`指定時。見積りには使わない診断情報)
 
 ```
 AI Development (git-derived + optional external metrics)
@@ -84,20 +105,21 @@ AI Co-authored    : 52.6% of commits (30/57), 13.7% of lines added
 - `AI Co-authored`はコミットトレーラーで検出できたAI関与の**下限値**。実際の支援率はこれより高い可能性が高い(詳細は「AI Development」章の注意を参照)。
 - `External AI metrics`テーブルは`--ai-metrics`で読み込んだ生の値をそのまま表示しているだけ(Accept Rateやレビュー時間など)。
 
-### 5. HTMLレポート(`--html`)
+### 6. HTMLレポート(`--html`)
 
-上記と同じ内容を、**トップにサマリ・人月カード**→**Size Classificationゲージ**→**SLOC/Score内訳グラフ**→**Effort Estimate(APF込み)**→**AI Development**→**詳細テーブル**の順にグラフ付きで表示する。ブラウザで開くだけで全体が見渡せるので、テキストレポートより説明resource向き。生成方法・構成の詳細は「HTMLレポート」章を参照。
+上記と同じ内容を、**トップにサマリ・人月カード**→**Overall Assessment**→**Size Classificationゲージ**→**SLOC/Score内訳グラフ**→**Effort Estimate(APF込み)**→**AI Development**→**詳細テーブル**の順にグラフ付きで表示する。ブラウザで開くだけで全体が見渡せるので、テキストレポートより説明resource向き。生成方法・構成の詳細は「HTMLレポート」章を参照。
 
 ### 一言でまとめると
 
 - **契約・計画に使う数字は1つだけ: `Effort Estimate`の`Total`(Base PM)。**
 - AIの影響を加味した参考値が欲しければ`Estimated PM (AI-adjusted)`を見る(ただしAPFは人が判断した数値であることを理解した上で)。
-- `AI Development`セクションとScore/分類は、あくまで規模感・開発実態の**診断情報**であり、人月には反映されない。
+- `Overall Assessment`・`AI Development`セクションとScore/分類は、あくまで規模感・開発実態の**診断情報**であり、人月には反映されない。
 
 ```
 python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effort]
                           [--productivity FILE] [--html FILE]
                           [--ai] [--ai-since WHEN] [--ai-metrics FILE]
+                          [--assess] [--assessment FILE]
 ```
 
 - `PATH` : スキャン対象ディレクトリ(省略時はカレントディレクトリ)
@@ -110,18 +132,21 @@ python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effor
 - `--ai` : AI Development節(git由来のLines Added/Deleted・Refactoring Ratio・AI共著コミット比率)を追加(詳細は「AI Development」の章)
 - `--ai-since WHEN` : `--ai`のgit解析対象を絞り込む(例 `"90 days ago"`)。大きい/ベンダー取り込みの履歴では推奨
 - `--ai-metrics FILE` : gitからは出せないAI関連メトリクス(AI生成コード比率・Copilot Accept Rate等)を外部ファイルから読み込む(`ai-metrics.example.json`参照。未指定なら推測せずN/A表示)。`ai_productivity_factor`を含む場合は`--ai`の有無に関わらずBase PMに乗算した調整後PMも表示(詳細は「見積りモデルと診断モデルの分離」参照)
+- `--assess` : Overall Assessmentスコアカード(Maintainability/Architecture/Cloud Native/Documentationのレター評価、AI Readiness、Overall Score)を追加(詳細は「Overall Assessment」の章)
+- `--assessment FILE` : Overall Assessmentのカテゴリ重み付けを上書き(`assessment.json` 参照)
 
-`sizecheck.sh` はアプリケーション名・HTML生成有無・AI Development節の有無を外部パラメータ化したラッパー(実行時にヘッダーを表示):
+`sizecheck.sh` はアプリケーション名・HTML生成有無・AI Development節・Overall Assessment節の有無を外部パラメータ化したラッパー(実行時にヘッダーを表示):
 
 ```
-bash sizecheck.sh [APP_NAME] [GENERATE_HTML] [GENERATE_AI]
+bash sizecheck.sh [APP_NAME] [GENERATE_HTML] [GENERATE_AI] [GENERATE_ASSESS]
 # または環境変数で指定
-APP_NAME=myapp GENERATE_HTML=false GENERATE_AI=true bash sizecheck.sh
+APP_NAME=myapp GENERATE_HTML=false GENERATE_AI=true GENERATE_ASSESS=false bash sizecheck.sh
 ```
 
 - `APP_NAME` : レポートに表示するアプリケーション名(省略時 `quarkusdroneshop`)
 - `GENERATE_HTML` : `true`/`false` で `report.html` の生成有無を切り替え(省略時 `true`)
 - `GENERATE_AI` : `true`/`false` でAI Development節の追加有無を切り替え(省略時 `false`)。`true`の場合、直下に`ai-metrics.json`があれば自動で`--ai-metrics`として読み込む
+- `GENERATE_ASSESS` : `true`/`false` でOverall Assessment節の追加有無を切り替え(省略時 `true`)。直下に`assessment.json`があれば自動で`--assessment`として読み込む
 
 実行例:
 
@@ -133,6 +158,7 @@ $ bash sizecheck.sh
  Application  : quarkusdroneshop
  Generate HTML: true
  Generate AI  : false
+ Generate Assess: true
 ============================================================
 Software Size Summary
 ...
@@ -360,9 +386,53 @@ Note: Judged by <name/team>, <date>: ...
 
 `ai_productivity_factor_note`は任意項目で、誰がいつどう判断したかの記録用(監査・再確認のため)。
 
-### 今回スコープ外にしたもの
+## Overall Assessment (--assess)
 
-ユーザー提案の「LOC規模20%・アーキテクチャ20%・複雑度20%・テスト品質15%・ドキュメント10%・クラウドネイティブ成熟度10%・AI開発成熟度5%」のようなA〜Fレター評価による**Overall Assessmentロールアップ**は、今回は実装していない。理由は、平均CCやカバレッジ率をどこで「A」「B」と線引きするかという閾値そのものが編集判断であり、確認なしに閾値を決め打ちすると、根拠のない評価に見かけ上の権威を与えてしまうため。重み配分・各カテゴリの閾値(例: Average CC ≤5ならA、6〜10ならB…)を具体的に決めたい場合は、別途相談のうえ実装する。
+`--assess`は、規模(Score)や人月(PM)とは別に、**Maintainability・Architecture・Cloud Native・Documentation・AI Readiness**の5カテゴリを0-100点でスコアリングし、レター評価(A+〜F)と、重み付き合成の**Overall Score**を出すヒューリスティックなスコアカード。**Base PM/APFには一切影響しない**(見積りモデルと完全に独立)。
+
+### レター評価のしきい値
+
+一般的な学校の成績表と同じ、標準的な換算を採用(このツール独自の恣意的な区切りではない):
+
+| Score | Grade | Score | Grade | Score | Grade |
+|---|---|---|---|---|---|
+| 97-100 | A+ | 83-86 | B | 60-69 | D |
+| 93-96 | A | 80-82 | B- | 0-59 | F |
+| 90-92 | A- | 77-79 | C+ | | |
+| 87-89 | B+ | 73-76 | C | | |
+| | | 70-72 | C- | | |
+
+### 各カテゴリの採点ルール(ルーブリック)
+
+すべて「何を満たすと何点になるか」を明記したチェックリスト形式にしている。既存メトリクスの比率をそのまま点数化する(例: OpenAPI仕様ファイル数÷REST APIエンドポイント数)ような、単位の異なる値同士を比べる指標は、見かけ上精密でも実態を反映しないため採用していない。
+
+- **Maintainability**: Average CC(低いほど高得点: ≤5→100, ≤8→90, ≤12→75, ≤20→55, それ以上→35)と、Coverageが分かればその値、を平均。両方無ければ`N/A`。**Maximum CC はスコアに使わない**(このツールの複雑度計測は正規表現による波括弧マッチングのため、ミニファイ済み/ベンダー取り込みのフロントエンドバンドルなどで実態と無関係に跳ね上がることがあり、外れ値1つに評価を左右されないようにするため)。
+- **Architecture**: 基礎点50点 + Modules≥2で+15 + Microservices≥2で+15 + OpenAPI Specsが1つでもあれば+10 + AsyncAPI Specsが1つでもあれば+10(満点100)。
+- **Cloud Native**: 基礎点40点 + Deploymentsが1つでもあれば+20 + Helm Chartsが1つでもあれば+15 + StatefulSetsまたはCronJobsがあれば+10 + Deployments数がMicroservices数の半分以上あれば+15(満点100)。
+- **Documentation**: Markdown SLOC ÷ Total SLOC の比率で採点(≥8%→100, ≥4%→85, ≥2%→70, ≥0.5%→55, それ未満→35) + OpenAPI/AsyncAPI仕様があれば+10のボーナス。ベンダー取り込みのMarkdown(upstreamのCHANGELOG等)を含むと過大評価になる点はSLOCと同様。
+- **AI Readiness**: `--ai`のAI共著コミット比率、および`--ai-metrics`のAI生成率・Accept Rate・テスト生成/レビュー/リファクタリング利用フラグを、取得できたものだけ平均。**どちらも無ければ`N/A`**(データが無いのに推測はしない)。
+
+### カテゴリの重み付け(assessment.json)
+
+既定の重み(`assessment.json`、合計100%):
+
+```json
+{
+  "maintainability": 35,
+  "architecture": 25,
+  "cloud_native": 15,
+  "documentation": 15,
+  "ai_readiness": 10
+}
+```
+
+`--assessment FILE`で自社の判断に合わせて重みを差し替えられる。あるカテゴリが`N/A`の場合、そのカテゴリの重みを除外して残りの重みで再正規化した上でOverall Scoreを算出する(例: AI Readinessが`N/A`なら残り90%分の重みで100%相当に計算し直す)。
+
+### 重要な注意
+
+- 各カテゴリのしきい値(CC≤5=100点、Markdown比率8%=100点、など)は**このツールが決めた基準であり、絶対的な品質基準ではない**。組織によって適正な値は異なるため、まずは自プロジェクト内での相対比較・時系列比較に使うことを推奨する。
+- Architecture/Cloud NativeでMicroservices構成でないプロジェクトが低評価になるのは「単一責務のシンプルな構成」を罰しているわけではなく、ルーブリックが「複数モジュール・複数サービス・K8sマニフェスト」を加点対象にしているという設計上の帰結。モノリシックな設計が悪いという意味ではない。
+- Overall Assessmentは`Score`(規模)・`Effort Estimate`(人月)のどちらにも影響しない。3つのモデル(規模スコア/見積りモデル/診断スコアカード)は完全に独立している。
 
 ## 使う上での注意点
 
@@ -370,6 +440,7 @@ Note: Judged by <name/team>, <date>: ...
 - Coverageはjacoco.xml/coverage-summary.jsonが見つかった場合のみ算出され、無い場合はN/A。
 - `--productivity` を省略するとビルトインのIPAデフォルトが使われる。企業独自の値を常用したい場合は `sizecheck.sh` に `--productivity productivity.json`(または自社ファイル)を含めておくこと。
 - `--ai`はデフォルトで無効(opt-in)。有効にする場合、ベンダー取り込みリポジトリを含む大きなワークスペースでは `--ai-since` で期間を絞ること(パフォーマンス上の注意を参照)。
+- `--assess`のレター評価はこのツール独自のルーブリックによる相対評価であり、業界標準の品質認証ではない。閾値は`README`に全て明記しているので、社内基準と合わない場合は`assessment.json`で重みを、または`software_size.py`のスコア関数(`score_maintainability`等)のしきい値を直接調整すること。
 
 ## 更新履歴(主な機能追加)
 
@@ -381,3 +452,4 @@ Note: Judged by <name/team>, <date>: ...
 6. **`sizecheck.sh`の外部パラメータ化**: `APP_NAME`/`GENERATE_HTML`/`GENERATE_AI`を引数・環境変数で指定可能に(実行時ヘッダー表示)。
 7. **AI Development追加**(`--ai`): 全`.git`リポジトリを横断してLines Added/Deleted・Refactoring Ratio・AI共著コミット比率をgitから実測。gitで測れない指標(AI生成率・Accept Rate等)は`--ai-metrics FILE`で外部入力(捏造しない)。
 8. **AI Productivity Factor (APF) 追加**: 見積りモデル(Base PM)とAI診断モデルを分離したまま、AIの影響を人月に反映したい場合のみ`ai-metrics.json`の`ai_productivity_factor`(人が判断した数値)をBase PMに乗算。判断根拠(AI生成率・Accept Rate・テスト生成/レビュー/リファクタリング利用の有無)も併記して監査可能にした。
+9. **Overall Assessment追加**(`--assess`): Maintainability/Architecture/Cloud Native/Documentationのレター評価、AI Readiness・Overall Scoreをサマリに追加。カテゴリ重みは`assessment.json`に外部化、各カテゴリの採点ルーブリックは全てREADMEに明記。Base PM/APFには一切影響しない、独立した第3のモデルとして実装。
