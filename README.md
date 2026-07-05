@@ -21,13 +21,32 @@ python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effor
 - `--productivity FILE` : 人月換算の生産性テーブルを上書き(`productivity.json` 参照。詳細は「人月試算」の章)
 - `--html FILE` : グラフ付きのリッチなHTMLレポートを指定パスに出力(詳細は「HTMLレポート」の章)
 
-`sizecheck.sh` に以下を用意済み:
+`sizecheck.sh` はアプリケーション名・HTML生成有無を外部パラメータ化したラッパー(実行時にヘッダーを表示):
 
 ```
-python3 software_size.py .. --name quarkusdroneshop --weights weights.json --effort --productivity productivity.json --html report.html
+bash sizecheck.sh [APP_NAME] [GENERATE_HTML]
+# または環境変数で指定
+APP_NAME=myapp GENERATE_HTML=false bash sizecheck.sh
 ```
 
-(このディレクトリ自身が測定対象ワークスペースのサブディレクトリという想定のため `..` を指定している。別プロジェクトで使う場合はパスを読み替える。)
+- `APP_NAME` : レポートに表示するアプリケーション名(省略時 `quarkusdroneshop`)
+- `GENERATE_HTML` : `true`/`false` で `report.html` の生成有無を切り替え(省略時 `true`)
+
+実行例:
+
+```
+$ bash sizecheck.sh
+============================================================
+ Software Size Report
+------------------------------------------------------------
+ Application  : quarkusdroneshop
+ Generate HTML: true
+============================================================
+Software Size Summary
+...
+```
+
+(このディレクトリ自身が測定対象ワークスペースのサブディレクトリという想定のため内部で `..` を指定している。別プロジェクトで使う場合は `sizecheck.sh` 内のパスを読み替える。)
 
 ## 計測項目
 
