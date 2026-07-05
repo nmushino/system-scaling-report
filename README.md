@@ -2,7 +2,7 @@
 
 # ソフトウェア規模計測ツール (software_size.py)
 
-## 参考資料
+## 人月換算の参考資料
 
 - [ソフトウェア開発 分析データ集 2022 (IPA)](https://www.ipa.go.jp/digital/software-survey/metrics/hjuojm000000c6it-att/000102171.pdf) からチェック
 
