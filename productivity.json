@@ -1,0 +1,19 @@
+{
+  "hours_per_person_month": 160,
+  "java": {
+    "bands": [
+      {"max_sloc": 40000, "rate_sloc_per_hour": 3.94},
+      {"max_sloc": 100000, "rate_sloc_per_hour": 5.15},
+      {"max_sloc": 300000, "rate_sloc_per_hour": 5.76},
+      {"max_sloc": null, "rate_sloc_per_hour": 5.92}
+    ]
+  },
+  "node": {
+    "bands": [
+      {"max_sloc": 40000, "rate_sloc_per_hour": 3.94},
+      {"max_sloc": 100000, "rate_sloc_per_hour": 5.15},
+      {"max_sloc": 300000, "rate_sloc_per_hour": 5.76},
+      {"max_sloc": null, "rate_sloc_per_hour": 5.92}
+    ]
+  }
+}

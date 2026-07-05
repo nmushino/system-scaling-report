@@ -1,0 +1,13 @@
+{
+  "hours_per_person_month": 160,
+  "java": {
+    "bands": [
+      {"max_sloc": null, "rate_sloc_per_hour": 5.0}
+    ]
+  },
+  "node": {
+    "bands": [
+      {"max_sloc": null, "rate_sloc_per_hour": 7.5}
+    ]
+  }
+}

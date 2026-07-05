@@ -9,24 +9,27 @@ a size band (Tiny / Small / Medium / Large / Enterprise).
 
 Usage:
     python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effort]
+                              [--productivity FILE] [--html FILE]
 
-    PATH            Directory to scan (default: current directory)
-    --name NAME     Project name shown in the report (default: dir name)
-    --json          Also dump the raw metrics + score as JSON
-    --weights FILE  JSON file overriding the default weight table
-    --effort        Add a person-months estimate for Java SLOC and
-                     Node (TypeScript+JavaScript) SLOC, based on IPA's
-                     published SLOC-productivity-by-size-band table.
+    PATH                Directory to scan (default: current directory)
+    --name NAME         Project name shown in the report (default: dir name)
+    --json              Also dump the raw metrics + score as JSON
+    --weights FILE      JSON file overriding the default weight table
+    --effort            Print the Java/Node person-months estimate in the
+                         text report (the HTML report always includes it).
+    --productivity FILE JSON file overriding the default person-months
+                         productivity table (see productivity.json /
+                         productivity.example.json).
+    --html FILE          Write a self-contained HTML report (with charts)
+                         to this path.
 
 Notes:
-    - IPA's "ソフトウェア開発分析データ集" does not publish separate
-      productivity figures per language (Java vs JavaScript/Node) -- only
-      an overall, mixed-language table segmented by SLOC size band and
-      development type (表A1-2-4, 新規開発:全年度, n=1,246, 2022年版).
-      --effort applies that same size-banded table to the Java SLOC and
-      the Node SLOC of the scanned project separately, which is the most
-      faithful way to get a "Java-scale" and "Node-scale" estimate out of
-      IPA's public data. Treat the result as a rough-order-of-magnitude
+    - Person-months are estimated from a size-banded SLOC-productivity table
+      (default: IPA's "ソフトウェア開発分析データ集2022" 表A1-2-4, 新規開発:
+      全年度, n=1,246 -- IPA does not publish a per-language breakdown, so
+      the same table is applied to Java SLOC and Node SLOC separately by
+      default). Pass --productivity to plug in your own company's measured
+      rates per language. Treat the result as a rough-order-of-magnitude
       estimate, not a committed estimate.
     - Uses `cloc` for SLOC counting when available (accurate comment/blank
       stripping across languages), otherwise falls back to a built-in
@@ -44,6 +47,7 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -83,18 +87,37 @@ DEFAULT_WEIGHTS = {
     "complexity": 10,  # applied to Average CC
 }
 
-# IPA "ソフトウェア開発分析データ集2022" 表A1-2-4 (新規開発:全年度, n=1,246)
-# SLOC生産性の中央値 [SLOC/人時]、全言語混在・SLOC規模帯別。
-# IPA does not publish a per-language breakdown, so this same table is
-# applied to Java SLOC and Node SLOC independently when --effort is used.
-# Upper bound of the SLOC band is exclusive; last band is open-ended.
-IPA_PRODUCTIVITY_BANDS = [
-    (40_000, 3.94),
-    (100_000, 5.15),
-    (300_000, 5.76),
-    (float("inf"), 5.92),
-]
-IPA_HOURS_PER_PERSON_MONTH = 160  # per IPA's stated 1人月=160人時 convention
+# Default person-months productivity table (ships as productivity.json).
+# Source: IPA "ソフトウェア開発分析データ集2022" 表A1-2-4 (新規開発:全年度,
+# n=1,246), SLOC生産性の中央値 [SLOC/人時]、全言語混在・SLOC規模帯別。
+# IPA publishes no per-language breakdown, so by default the same table is
+# applied to Java SLOC and Node SLOC independently. Override with
+# --productivity FILE to plug in your own company's measured rates per
+# language (see productivity.example.json). "max_sloc": null means the band
+# has no upper bound.
+DEFAULT_PRODUCTIVITY = {
+    "hours_per_person_month": 160,
+    "java": {"bands": [
+        {"max_sloc": 40000, "rate_sloc_per_hour": 3.94},
+        {"max_sloc": 100000, "rate_sloc_per_hour": 5.15},
+        {"max_sloc": 300000, "rate_sloc_per_hour": 5.76},
+        {"max_sloc": None, "rate_sloc_per_hour": 5.92},
+    ]},
+    "node": {"bands": [
+        {"max_sloc": 40000, "rate_sloc_per_hour": 3.94},
+        {"max_sloc": 100000, "rate_sloc_per_hour": 5.15},
+        {"max_sloc": 300000, "rate_sloc_per_hour": 5.76},
+        {"max_sloc": None, "rate_sloc_per_hour": 5.92},
+    ]},
+}
+
+
+def load_productivity(path):
+    config = json.loads(json.dumps(DEFAULT_PRODUCTIVITY))  # deep copy
+    if path:
+        with open(path) as f:
+            config.update(json.load(f))
+    return config
 
 # Upper bound is exclusive; last band is open-ended.
 SIZE_BANDS = [
@@ -440,13 +463,32 @@ def find_coverage(root):
 # Scoring
 # ---------------------------------------------------------------------------
 
-def estimate_person_months(sloc):
-    """Person-months for `sloc` lines, via IPA's size-banded productivity table."""
+def estimate_person_months(sloc, bands, hours_per_month):
+    """Person-months for `sloc` lines, via a size-banded productivity table."""
     if sloc <= 0:
         return 0.0, None
-    rate_per_hour = next(rate for upper, rate in IPA_PRODUCTIVITY_BANDS if sloc < upper)
-    rate_per_month = rate_per_hour * IPA_HOURS_PER_PERSON_MONTH
+    rate_per_hour = bands[-1]["rate_sloc_per_hour"]
+    for band in bands:
+        max_sloc = band.get("max_sloc")
+        if max_sloc is None or sloc < max_sloc:
+            rate_per_hour = band["rate_sloc_per_hour"]
+            break
+    rate_per_month = rate_per_hour * hours_per_month
     return round(sloc / rate_per_month, 1), rate_per_hour
+
+
+def compute_effort(metrics, productivity):
+    java_sloc = metrics["sloc_by_lang"].get("Java", 0)
+    node_sloc = metrics["sloc_by_lang"].get("TypeScript", 0) + metrics["sloc_by_lang"].get("JavaScript", 0)
+    hours = productivity["hours_per_person_month"]
+    java_months, java_rate = estimate_person_months(java_sloc, productivity["java"]["bands"], hours)
+    node_months, node_rate = estimate_person_months(node_sloc, productivity["node"]["bands"], hours)
+    return {
+        "hours_per_person_month": hours,
+        "java_sloc": java_sloc, "java_rate": java_rate, "java_person_months": java_months,
+        "node_sloc": node_sloc, "node_rate": node_rate, "node_person_months": node_months,
+        "total_person_months": round(java_months + node_months, 1),
+    }
 
 
 def classify(score):
@@ -477,23 +519,20 @@ def compute_score(metrics, weights):
 # Report rendering
 # ---------------------------------------------------------------------------
 
-def render_effort_section(metrics):
-    java_sloc = metrics["sloc_by_lang"].get("Java", 0)
-    node_sloc = metrics["sloc_by_lang"].get("TypeScript", 0) + metrics["sloc_by_lang"].get("JavaScript", 0)
-    java_months, java_rate = estimate_person_months(java_sloc)
-    node_months, node_rate = estimate_person_months(node_sloc)
+def render_effort_section(effort, productivity_source):
     lines = []
     add = lines.append
     add("")
-    add("Effort Estimate (IPA size-banded productivity, 新規開発:全年度 中央値)")
+    add(f"Effort Estimate (productivity: {productivity_source})")
     add("-" * 60)
-    add(f"Java SLOC       : {java_sloc:,}  (rate {java_rate} SLOC/人時) -> {java_months} 人月")
-    add(f"Node SLOC       : {node_sloc:,}  (TS+JS, rate {node_rate} SLOC/人時) -> {node_months} 人月")
-    add(f"Total           : {java_months + node_months:.1f} 人月")
-    add("* IPA publishes no per-language rate; the same overall size-banded")
-    add("  table is applied to each language's SLOC. Treat as ROM estimate.")
-    return "\n".join(lines), {"java_sloc": java_sloc, "java_person_months": java_months,
-                               "node_sloc": node_sloc, "node_person_months": node_months}
+    add(f"Java SLOC       : {effort['java_sloc']:,}  (rate {effort['java_rate']} SLOC/人時) "
+        f"-> {effort['java_person_months']} 人月")
+    add(f"Node SLOC       : {effort['node_sloc']:,}  (TS+JS, rate {effort['node_rate']} SLOC/人時) "
+        f"-> {effort['node_person_months']} 人月")
+    add(f"Total           : {effort['total_person_months']} 人月")
+    add("* Default rates are IPA's overall size-banded median (no official")
+    add("  per-language split exists). Pass --productivity for your own rates.")
+    return "\n".join(lines)
 
 
 def render_report(name, metrics, weights, score, classification):
@@ -568,6 +607,227 @@ def render_report(name, metrics, weights, score, classification):
 
 
 # ---------------------------------------------------------------------------
+# HTML report (self-contained, inline SVG charts, no external dependencies)
+# ---------------------------------------------------------------------------
+
+def _esc(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _fmt_num(value):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return _esc(value)
+    return f"{int(f):,}" if f.is_integer() else f"{f:,.1f}"
+
+
+def _svg_bar_chart(items, unit="", width=620, bar_h=26, gap=10, color="#2563eb"):
+    """items: list of (label, value). Renders a horizontal bar chart as inline SVG."""
+    items = [(label, value) for label, value in items if value is not None]
+    if not items:
+        return '<p class="note">No data</p>'
+    max_v = max(value for _, value in items) or 1
+    label_w = 150
+    value_margin = 140
+    chart_w = width - label_w - value_margin
+    height = len(items) * (bar_h + gap) + gap
+    rows = []
+    y = gap
+    for label, value in items:
+        bar_len = max((value / max_v) * chart_w, 0) if max_v else 0
+        rows.append(f'<text x="{label_w - 8}" y="{y + bar_h * 0.7:.1f}" text-anchor="end" '
+                     f'class="chart-label">{_esc(label)}</text>')
+        rows.append(f'<rect x="{label_w}" y="{y}" width="{bar_len:.1f}" height="{bar_h}" '
+                     f'rx="4" fill="{color}"/>')
+        rows.append(f'<text x="{label_w + bar_len + 8:.1f}" y="{y + bar_h * 0.7:.1f}" '
+                     f'class="chart-value">{_fmt_num(value)}{unit}</text>')
+        y += bar_h + gap
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(rows)}</svg>')
+
+
+def _svg_gauge(score, bands, width=680):
+    """Horizontal segmented gauge showing where `score` lands across SIZE_BANDS.
+
+    Band labels are rendered as an evenly-spaced legend row (not centered inside
+    each segment), because narrow bands next to a dominant open-ended band would
+    otherwise overlap.
+    """
+    colors = ["#93c5fd", "#60a5fa", "#3b82f6", "#f59e0b", "#ef4444"]
+    finite_bounds = [upper for upper, _ in bands if upper != float("inf")]
+    display_max = max(finite_bounds[-1] * 1.3, score * 1.15, 100)
+    bar_h, y = 28, 34
+    legend_y = y + bar_h + 28
+    height = legend_y + 14
+    segments = []
+    prev = 0.0
+    x = 0.0
+    for (upper, _label), color in zip(bands, colors):
+        seg_upper = min(upper, display_max)
+        seg_w = max((seg_upper - prev) / display_max * width, 0)
+        segments.append(f'<rect x="{x:.1f}" y="{y}" width="{seg_w:.1f}" height="{bar_h}" fill="{color}"/>')
+        x += seg_w
+        prev = upper
+        if seg_upper >= display_max:
+            break
+    marker_x = min(max(score / display_max * width, 8), width - 8)
+    segments.append(f'<polygon points="{marker_x - 7:.1f},{y - 10} {marker_x + 7:.1f},{y - 10} '
+                     f'{marker_x:.1f},{y + 2}" fill="#111827"/>')
+    segments.append(f'<text x="{marker_x:.1f}" y="{y - 14}" text-anchor="middle" '
+                     f'class="chart-marker">Score {score}</text>')
+    legend_col_w = width / len(bands)
+    for i, ((_upper, label), color) in enumerate(zip(bands, colors)):
+        lx = i * legend_col_w
+        segments.append(f'<rect x="{lx:.1f}" y="{legend_y}" width="10" height="10" rx="2" fill="{color}"/>')
+        segments.append(f'<text x="{lx + 14:.1f}" y="{legend_y + 9}" class="chart-label">{_esc(label)}</text>')
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(segments)}</svg>')
+
+
+def render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source):
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    badge_colors = {"Tiny": "#60a5fa", "Small": "#3b82f6", "Medium": "#2563eb",
+                    "Large": "#f59e0b", "Enterprise": "#ef4444"}
+    badge_color = badge_colors.get(classification, "#2563eb")
+
+    sloc_items = sorted(metrics["sloc_by_lang"].items(), key=lambda kv: -kv[1])
+    breakdown_items = list(breakdown.items())
+    effort_items = [("Java", effort["java_person_months"]), ("Node (TS+JS)", effort["node_person_months"])]
+
+    def stat_card(label, value, sub="", accent=False):
+        cls = "card accent" if accent else "card"
+        return (f'<div class="{cls}"><div class="card-label">{_esc(label)}</div>'
+                f'<div class="card-value">{_esc(value)}</div>'
+                f'<div class="card-sub">{_esc(sub)}</div></div>')
+
+    def table_section(title, rows):
+        trs = "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in rows)
+        return f'<div class="panel"><h3>{_esc(title)}</h3><table>{trs}</table></div>'
+
+    architecture_rows = [
+        ("Modules", metrics["modules"]), ("Microservices", metrics["microservices"]),
+        ("REST APIs", metrics["rest_apis"]), ("GraphQL APIs", metrics["graphql_apis"]),
+        ("Camel Routes", metrics["camel_routes"]), ("Kafka Topics", metrics["kafka_topics"]),
+    ]
+    data_rows = [
+        ("Database Tables", metrics["db_tables"]), ("Entities", metrics["entities"]),
+        ("OpenAPI Specs", metrics["openapi_specs"]), ("AsyncAPI Specs", metrics["asyncapi_specs"]),
+    ]
+    cloud_rows = [
+        ("Deployments", metrics["deployments"]), ("StatefulSets", metrics["statefulsets"]),
+        ("CronJobs", metrics["cronjobs"]), ("Helm Charts", metrics["helm_charts"]),
+        ("Operators", metrics["operators"]),
+    ]
+    complexity_rows = [
+        ("Average CC", metrics["avg_cc"] if metrics["avg_cc"] is not None else "N/A"),
+        ("Maximum CC", metrics["max_cc"] if metrics["max_cc"] is not None else "N/A"),
+        ("Coverage", f"{metrics['coverage']}%" if metrics["coverage"] is not None else "N/A"),
+    ]
+    dependency_rows = [
+        ("Maven Modules", metrics["maven_modules"]), ("Node Packages", metrics["node_packages"]),
+        ("Container Images", metrics["container_images"]),
+    ]
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Software Size Report - {_esc(name)}</title>
+<style>
+  :root {{ --accent: {badge_color}; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: -apple-system, "Hiragino Sans", "Yu Gothic", "Segoe UI", sans-serif;
+          margin: 0; background: #f3f4f6; color: #111827; }}
+  header {{ background: #111827; color: #fff; padding: 28px 32px; }}
+  header h1 {{ margin: 0 0 4px; font-size: 22px; }}
+  header .meta {{ opacity: .65; font-size: 13px; }}
+  main {{ max-width: 1080px; margin: 0 auto; padding: 24px 32px 60px; }}
+  .hero {{ display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }}
+  .card {{ background: #fff; border-radius: 12px; padding: 16px 20px; flex: 1 1 150px;
+           box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+  .card-label {{ font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }}
+  .card-value {{ font-size: 26px; font-weight: 700; margin-top: 4px; }}
+  .card-sub {{ font-size: 12px; color: #9ca3af; margin-top: 2px; }}
+  .card.accent .card-value {{ color: var(--accent); }}
+  .panel {{ background: #fff; border-radius: 12px; padding: 20px 24px; margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
+  .panel h2 {{ margin-top: 0; font-size: 16px; }}
+  .panel h3 {{ margin-top: 0; font-size: 14px; color: #374151; }}
+  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+  th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #f3f4f6; }}
+  th {{ font-weight: 500; color: #6b7280; width: 60%; }}
+  .chart-label {{ font-size: 12px; fill: #374151; }}
+  .chart-value {{ font-size: 12px; fill: #111827; }}
+  .chart-marker {{ font-size: 12px; fill: #111827; font-weight: 600; }}
+  .note {{ font-size: 12px; color: #9ca3af; margin-top: 10px; line-height: 1.7; }}
+  @media (max-width: 720px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Software Size Report - {_esc(name)}</h1>
+  <div class="meta">Generated {generated}</div>
+</header>
+<main>
+  <section class="hero">
+    {stat_card("Software Size Score", score, "weighted score", accent=True)}
+    {stat_card("Classification", classification, "Tiny / Small / Medium / Large / Enterprise", accent=True)}
+    {stat_card("Total SLOC", f"{metrics['total_sloc']:,}", f"{metrics['files']:,} files")}
+    {stat_card("Effort: Java", f"{effort['java_person_months']} 人月", f"{effort['java_sloc']:,} SLOC")}
+    {stat_card("Effort: Node", f"{effort['node_person_months']} 人月", f"{effort['node_sloc']:,} SLOC (TS+JS)")}
+    {stat_card("Effort: Total", f"{effort['total_person_months']} 人月", "Java + Node", accent=True)}
+  </section>
+
+  <div class="panel">
+    <h2>Size Classification</h2>
+    {_svg_gauge(score, SIZE_BANDS)}
+  </div>
+
+  <div class="grid-2">
+    <div class="panel">
+      <h2>SLOC by Language</h2>
+      {_svg_bar_chart(sloc_items, unit=" SLOC")}
+    </div>
+    <div class="panel">
+      <h2>Score Breakdown by Weight Category</h2>
+      {_svg_bar_chart(breakdown_items, unit=" pt", color="#10b981")}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Effort Estimate (Person-Months)</h2>
+    {_svg_bar_chart(effort_items, unit=" 人月", color="#8b5cf6")}
+    <p class="note">
+      Productivity source: {_esc(productivity_source)} &middot;
+      hours per person-month: {effort['hours_per_person_month']}<br>
+      Default rates come from IPA's overall, mixed-language SLOC productivity table
+      (no official per-language Java/Node split exists) &mdash; pass --productivity to
+      plug in your own company's measured rates. Treat as a rough-order-of-magnitude estimate.
+    </p>
+  </div>
+
+  <div class="grid-2">
+    {table_section("Architecture", architecture_rows)}
+    {table_section("Data", data_rows)}
+    {table_section("Cloud Native", cloud_rows)}
+    {table_section("Complexity", complexity_rows)}
+  </div>
+  {table_section("Dependencies", dependency_rows)}
+
+  <p class="note">
+    Metrics are collected via regex-based heuristics, not a certified static analyzer &mdash;
+    use for relative size comparison, not code-quality audits. Vendored/third-party code
+    inflates SLOC and effort if not excluded before scanning.
+  </p>
+</main>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -630,7 +890,9 @@ def main():
     parser.add_argument("--json", action="store_true", help="Also print raw metrics + score as JSON")
     parser.add_argument("--weights", help="JSON file overriding the default weight table")
     parser.add_argument("--effort", action="store_true",
-                         help="Add a Java/Node person-months estimate based on IPA productivity data")
+                         help="Print the Java/Node person-months estimate in the text report")
+    parser.add_argument("--productivity", help="JSON file overriding the default person-months productivity table")
+    parser.add_argument("--html", help="Write a self-contained HTML report (with charts) to this path")
     args = parser.parse_args()
 
     root = os.path.abspath(args.path)
@@ -643,16 +905,24 @@ def main():
         with open(args.weights) as f:
             weights.update(json.load(f))
 
+    productivity = load_productivity(args.productivity)
+    productivity_source = args.productivity or "built-in default (IPA 表A1-2-4)"
+
     metrics = collect_metrics(root)
     score, breakdown = compute_score(metrics, weights)
     classification = classify(score)
+    effort = compute_effort(metrics, productivity)
 
     print(render_report(name, metrics, weights, score, classification))
 
-    effort = None
     if args.effort:
-        effort_text, effort = render_effort_section(metrics)
-        print(effort_text)
+        print(render_effort_section(effort, productivity_source))
+
+    if args.html:
+        html = render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source)
+        with open(args.html, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"\nHTML report written to {args.html}")
 
     if args.json:
         print()
