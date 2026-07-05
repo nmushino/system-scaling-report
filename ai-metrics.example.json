@@ -1,0 +1,17 @@
+{
+  "source": "GitHub Copilot Metrics API export, 2026-06 (example -- replace with real data)",
+  "ai_generated_sloc": 18200,
+  "ai_generated_ratio_pct": 40,
+  "copilot_accept_rate_pct": 65,
+  "estimated_review_hours": 120,
+  "estimated_coding_hours": 420,
+  "prompt_count": null,
+  "test_generation_ratio_pct": null,
+
+  "ai_test_generation_used": true,
+  "ai_review_used": true,
+  "ai_refactoring_used": true,
+
+  "ai_productivity_factor": 0.82,
+  "ai_productivity_factor_note": "Judged by <name/team>, <date>: based on the AI generation/accept rate and usage flags above. This tool does not compute APF from those fields -- it is entered here as a plain number by whoever is best placed to judge it."
+}

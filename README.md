@@ -6,11 +6,98 @@
 
 ## 概要
 
-`software_size.py` は、指定ディレクトリ配下をスキャンして SLOC・アーキテクチャ・データ・クラウドネイティブ・複雑度などのメトリクスを収集し、重み付けした「Software Size Score」を算出、Tiny〜Enterpriseに分類するツール。単一リポジトリでもマルチリポジトリのワークスペース全体でも実行可能。
+`software_size.py` は、指定ディレクトリ配下をスキャンして SLOC・アーキテクチャ・データ・クラウドネイティブ・複雑度などのメトリクスを収集し、重み付けした「Software Size Score」を算出、Tiny〜Enterpriseに分類するツール。単一リポジトリでもマルチリポジトリのワークスペース全体でも実行可能。テキストレポート・HTMLレポートいずれも **サマリ(Score/分類/SLOC/人月)を先頭、詳細セクションをその後** に表示する。
+
+## レポートの見方
+
+実際の出力(`quarkusdroneshop-web`に対して全オプション有効で実行した例)に沿って、各行が何を意味するかを説明する。
+
+```
+python3 software_size.py ../quarkusdroneshop-web --name quarkusdroneshop-web \
+  --weights weights.json --effort --productivity productivity.json \
+  --ai --ai-since "90 days ago" --ai-metrics ai-metrics.example.json
+```
+
+### 1. Summary(最初に見る場所)
+
+```
+Summary
+-------
+Name           : quarkusdroneshop-web
+Score          : 115 points -> Small
+SLOC           : 8,441
+Files          : 172
+Size Bands     : Tiny(<100) / Small(100-300) / Medium(300-700) / Large(700-1500) / Enterprise(1500+)
+```
+
+- **Score / 分類**: `weights.json`の重みを各メトリクスの生値に掛けて合算した値(算出方法は「スコア算出とサイズ分類」章)。分類は下の`Size Bands`の帯のどこに入るかを示すだけで、それ以上の意味(良し悪し)は持たない。あくまで「相対的な規模感」の指標。
+- **SLOC / Files**: スキャン対象の総行数・総ファイル数。ベンダー取り込みコードを含むと過大になる点は「使う上での注意点」を参照。
+
+### 2. Effort Estimate(`--effort`指定時。契約・計画にはここだけ見ればよい)
+
+```
+Effort Estimate (productivity: productivity.json)
+  Java SLOC    : 3,323  (rate 3.94 SLOC/人時) -> 5.3 人月
+  Node SLOC    : 3,720  (TS+JS, rate 3.94 SLOC/人時) -> 5.9 人月
+  Total        : 11.2 人月  <- Base PM (contract/planning figure)
+```
+
+- **Base PM(= Total行)**: SLOCと`productivity.json`だけから機械的に再現できる、契約・計画用の人月。同じコード規模なら常に同じ値になる。
+- APFを使わない場合はここで終わり。**この数字だけを見積りに使えばよい。**
+
+```
+  APF (AI Productivity Factor): 0.82  (source: ai-metrics.example.json)
+  Estimated PM (AI-adjusted)  : 9.2 人月  (= 11.2 base x 0.82)
+    Java: 4.3 人月, Node: 4.8 人月
+  Basis (judged by whoever set APF, not computed by this tool):
+    AI Generated Ratio (%)  : 40
+    AI Accept Rate (%)      : 65
+    AI Test Generation      : Yes
+    AI Review Used          : Yes
+    AI Refactoring Used     : Yes
+```
+
+- `--ai-metrics`のファイルに`ai_productivity_factor`(APF)が入っている場合のみ表示される追加ブロック。**Base PMは変わらず、APFを掛けた別の数字が追加で出るだけ**。
+- `Estimated PM (AI-adjusted)`は「AIを使うと前提した場合の参考値」であり、**Base PMの代わりに使うかどうかは見積り側の判断**。ツールはどちらが正しいかを決めない。
+- `Basis`は、APFの値(0.82)を入力した人が何を根拠に判断したかの記録。ツールはこの根拠からAPFを計算していない(計算式にすると閾値の決め方が編集判断になるため、意図的にそうしていない)。数字の妥当性を後から確認するための情報。
+
+### 3. Project 〜 Dependencies(規模の内訳)
+
+Score算出の元になった生の数値。「スコア算出とサイズ分類」の重み表と対応させて見ると、どの要素がScoreを押し上げているかが分かる(例: `Modules`が多い/`REST APIs`が多いプロジェクトほどAPI・Module項目の寄与が大きくなる)。各項目の集計方法は「計測項目」章を参照。`Complexity`の`Coverage`はjacoco.xml等が無ければ`N/A`(推測しない)。
+
+### 4. AI Development(`--ai`指定時。見積りには使わない診断情報)
+
+```
+AI Development (git-derived + optional external metrics)
+------------------------------------------------------------
+Repos analyzed    : 1
+Commits analyzed  : 57
+Lines Added       : 7,958
+Lines Deleted     : 2,530
+Net Change        : +5,428
+Refactoring Ratio : 40.0% (balanced-churn heuristic: ...)
+                    0.0% of commits mention "refactor" in the message (keyword heuristic)
+AI Co-authored    : 52.6% of commits (30/57), 13.7% of lines added
+```
+
+- これは**Effort Estimateとは独立した診断セクション**であり、ここの数値がPMを変えることはない(APFはあくまで`ai-metrics.json`の値を直接使うのみ)。
+- `AI Co-authored`はコミットトレーラーで検出できたAI関与の**下限値**。実際の支援率はこれより高い可能性が高い(詳細は「AI Development」章の注意を参照)。
+- `External AI metrics`テーブルは`--ai-metrics`で読み込んだ生の値をそのまま表示しているだけ(Accept Rateやレビュー時間など)。
+
+### 5. HTMLレポート(`--html`)
+
+上記と同じ内容を、**トップにサマリ・人月カード**→**Size Classificationゲージ**→**SLOC/Score内訳グラフ**→**Effort Estimate(APF込み)**→**AI Development**→**詳細テーブル**の順にグラフ付きで表示する。ブラウザで開くだけで全体が見渡せるので、テキストレポートより説明resource向き。生成方法・構成の詳細は「HTMLレポート」章を参照。
+
+### 一言でまとめると
+
+- **契約・計画に使う数字は1つだけ: `Effort Estimate`の`Total`(Base PM)。**
+- AIの影響を加味した参考値が欲しければ`Estimated PM (AI-adjusted)`を見る(ただしAPFは人が判断した数値であることを理解した上で)。
+- `AI Development`セクションとScore/分類は、あくまで規模感・開発実態の**診断情報**であり、人月には反映されない。
 
 ```
 python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effort]
                           [--productivity FILE] [--html FILE]
+                          [--ai] [--ai-since WHEN] [--ai-metrics FILE]
 ```
 
 - `PATH` : スキャン対象ディレクトリ(省略時はカレントディレクトリ)
@@ -20,17 +107,21 @@ python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effor
 - `--effort` : Java SLOC / Node(TS+JS) SLOC から算出した人月概算をテキストレポートにも表示(HTMLレポートには常に表示される)
 - `--productivity FILE` : 人月換算の生産性テーブルを上書き(`productivity.json` 参照。詳細は「人月試算」の章)
 - `--html FILE` : グラフ付きのリッチなHTMLレポートを指定パスに出力(詳細は「HTMLレポート」の章)
+- `--ai` : AI Development節(git由来のLines Added/Deleted・Refactoring Ratio・AI共著コミット比率)を追加(詳細は「AI Development」の章)
+- `--ai-since WHEN` : `--ai`のgit解析対象を絞り込む(例 `"90 days ago"`)。大きい/ベンダー取り込みの履歴では推奨
+- `--ai-metrics FILE` : gitからは出せないAI関連メトリクス(AI生成コード比率・Copilot Accept Rate等)を外部ファイルから読み込む(`ai-metrics.example.json`参照。未指定なら推測せずN/A表示)。`ai_productivity_factor`を含む場合は`--ai`の有無に関わらずBase PMに乗算した調整後PMも表示(詳細は「見積りモデルと診断モデルの分離」参照)
 
-`sizecheck.sh` はアプリケーション名・HTML生成有無を外部パラメータ化したラッパー(実行時にヘッダーを表示):
+`sizecheck.sh` はアプリケーション名・HTML生成有無・AI Development節の有無を外部パラメータ化したラッパー(実行時にヘッダーを表示):
 
 ```
-bash sizecheck.sh [APP_NAME] [GENERATE_HTML]
+bash sizecheck.sh [APP_NAME] [GENERATE_HTML] [GENERATE_AI]
 # または環境変数で指定
-APP_NAME=myapp GENERATE_HTML=false bash sizecheck.sh
+APP_NAME=myapp GENERATE_HTML=false GENERATE_AI=true bash sizecheck.sh
 ```
 
 - `APP_NAME` : レポートに表示するアプリケーション名(省略時 `quarkusdroneshop`)
 - `GENERATE_HTML` : `true`/`false` で `report.html` の生成有無を切り替え(省略時 `true`)
+- `GENERATE_AI` : `true`/`false` でAI Development節の追加有無を切り替え(省略時 `false`)。`true`の場合、直下に`ai-metrics.json`があれば自動で`--ai-metrics`として読み込む
 
 実行例:
 
@@ -41,6 +132,7 @@ $ bash sizecheck.sh
 ------------------------------------------------------------
  Application  : quarkusdroneshop
  Generate HTML: true
+ Generate AI  : false
 ============================================================
 Software Size Summary
 ...
@@ -174,8 +266,118 @@ python3 -m http.server 8000
 
 `report.html` は生成物のため `.gitignore` に含めてコミット対象から除外している。
 
+## AI Development (--ai)
+
+2025〜2026年にかけて米国企業(GitHub/Microsoft/Google/McKinsey/ISBSGなど)が議論している「コード量だけでなく、AIがどれだけ支援したか・人間が何に時間を使ったか」という観点を、opt-inの`--ai`で追加できる。**gitから実際に検証できる指標だけを自動計算し、検証できない指標は捏造せず外部ファイルからのみ受け取る**という方針で実装している。
+
+### git由来の指標(自動計算、常に実データ)
+
+`--ai`を付けると、スキャン対象配下に存在する**すべての`.git`リポジトリ**(このツールはマルチリポジトリのワークスペースを想定しているため、サブプロジェクトごとの`.git`を横断集計する)から以下を算出する:
+
+| 指標 | 内容 |
+|---|---|
+| Lines Added / Lines Deleted | `git log --no-merges --numstat` の合算 |
+| Refactoring Ratio(balanced-churn) | コミットごとに `2×min(追加,削除)/(追加+削除)` を churn 重み付けで平均したもの。純粋な追加・削除より「既存コードの書き換え」に近いほど高くなるヒューリスティック |
+| Refactoring Ratio(keyword) | コミットメッセージ1行目に `refactor` を含む比率 |
+| AI Co-authored Commit Ratio | `Co-Authored-By: <tool>` トレーラー(Claude, Copilot, Cursor, Codeium, ChatGPT/OpenAI, Gemini, Devin, Windsurf, Tabnine, CodeWhisperer, Amazon Q 等を正規表現でマッチ)を含むコミットの比率、および該当コミットの追加行数比率 |
+
+```
+python3 software_size.py . --ai --ai-since "90 days ago"
+```
+
+**重要な注意**: `AI Co-authored`はコミットトレーラーを付与するツール(Claude Codeはデフォルトで付与)しか検出できない。GitHub Copilotの通常のオートコンプリート補完のようにコミットへ痕跡を残さない支援は捕捉できないため、**この数値はAI関与の下限値**であり、実際のAI支援率はこれより高い可能性がある。「Refactoring Ratio」も同様にヒューリスティックであり、ASTレベルでリファクタリングを判定しているわけではない。
+
+**パフォーマンス上の注意**: このワークスペースのように大量のベンダー取り込みリポジトリ(例: `developerhub-skeleton/backstage`は約71,000コミット)を含む場合、全履歴を対象にすると `git log --numstat` だけで1リポジトリ40秒以上かかることがある。`--ai-since "90 days ago"` のように直近の期間へ絞ることを強く推奨する(このリポジトリでは16リポジトリ・約720コミットに絞っても20秒程度で完了する)。
+
+### gitでは出せない指標(--ai-metrics FILEでのみ反映、未指定ならN/A)
+
+AI生成コード比率・Copilot/アシスタントのAccept Rate・レビュー時間・コーディング時間・プロンプト数・テスト生成比率などは、**gitにもファイルシステムにも実データが存在しない**(GitHub Copilot Metrics API、Cursorのアナリティクス、IDEプラグインのテレメトリなど、AIツール側の実測データが必要)。それらしい数値を推測で埋めることはしないため、`--ai-metrics FILE`を渡さない限りレポート上は「not provided」と表示される。
+
+`ai-metrics.example.json`(同梱、サンプル値):
+
+```json
+{
+  "source": "GitHub Copilot Metrics API export, 2026-06 (example -- replace with real data)",
+  "ai_generated_sloc": 18200,
+  "ai_generated_ratio_pct": 43,
+  "copilot_accept_rate_pct": 38,
+  "estimated_review_hours": 120,
+  "estimated_coding_hours": 420,
+  "prompt_count": null,
+  "test_generation_ratio_pct": null,
+  "ai_productivity_factor": 0.82
+}
+```
+
+```
+python3 software_size.py . --ai --ai-metrics ai-metrics.example.json
+```
+
+値が分からない項目は `null` のままでよい(レポートには表示されない)。実運用では実測値を入れた `ai-metrics.json` を用意し、`sizecheck.sh` の `GENERATE_AI=true` 実行時に自動で読み込ませるとよい。
+
+### 見積りモデルと診断モデルの分離、AI Productivity Factor (APF)
+
+見積り(人月)で重要なのは「同じ入力なら同じ結果になる」「なぜその数字なのか説明できる」ことなので、本ツールは次の2つを明確に分離している:
+
+- **見積りモデル**(`--effort`/`--productivity`): SLOC → IPA/COCOMO的な生産性テーブル → Base PM。契約・計画に使う数字で、SLOCと`productivity.json`だけから常に再現できる。
+- **AI診断**(`--ai`): git由来のLines Added/Deleted・Refactoring Ratio・AI共著コミット比率。あくまで観測・診断用であり、**Base PMの計算には一切使わない**。
+
+AIをそれでも人月へ反映したい場合、`AI Readiness`のような品質スコアを直接掛け合わせるのではなく、`ai-metrics.json`の `ai_productivity_factor` に**実測または合意済みの倍率をそのまま数値で指定**する方式にした:
+
+```
+Estimated PM (AI-adjusted) = Base PM × APF
+例: 714.2 × 0.82 = 585.6
+```
+
+- `ai_productivity_factor`を指定すると、`--ai`の有無に関わらずEffort Estimateセクションに `Base PM` と `Estimated PM (AI-adjusted)` が両方表示される(Base PMは常に変更されず契約用の数字として残る)。
+- APFをAIコード生成率・受入率・テスト生成有無などから自動算出する式は、閾値・重み付けの決め方自体が編集判断になるため実装していない。**その代わり、AIコード生成率・受入率・テスト生成/レビュー利用/リファクタリング利用の有無を`ai-metrics.json`に記録できるようにし、APFの「根拠(basis)」としてAPFの数値と一緒に表示する形にした**。APFの値そのものは自動計算せず、入力者(実測データを見て判断する人)がこれらの項目を踏まえて判断した数値をそのまま入力する:
+
+```json
+{
+  "ai_generated_ratio_pct": 40,
+  "copilot_accept_rate_pct": 65,
+  "ai_test_generation_used": true,
+  "ai_review_used": true,
+  "ai_refactoring_used": true,
+  "ai_productivity_factor": 0.82,
+  "ai_productivity_factor_note": "Judged by <name/team>, <date>: ..."
+}
+```
+
+これにより、Effort Estimateセクションには次のように表示される:
+
+```
+APF (AI Productivity Factor): 0.82  (source: ai-metrics.json)
+Estimated PM (AI-adjusted)  : 585.6 人月  (= 714.2 base x 0.82)
+Basis (judged by whoever set APF, not computed by this tool):
+  AI Generated Ratio (%)  : 40
+  AI Accept Rate (%)      : 65
+  AI Test Generation      : Yes
+  AI Review Used          : Yes
+  AI Refactoring Used     : Yes
+Note: Judged by <name/team>, <date>: ...
+```
+
+`ai_productivity_factor_note`は任意項目で、誰がいつどう判断したかの記録用(監査・再確認のため)。
+
+### 今回スコープ外にしたもの
+
+ユーザー提案の「LOC規模20%・アーキテクチャ20%・複雑度20%・テスト品質15%・ドキュメント10%・クラウドネイティブ成熟度10%・AI開発成熟度5%」のようなA〜Fレター評価による**Overall Assessmentロールアップ**は、今回は実装していない。理由は、平均CCやカバレッジ率をどこで「A」「B」と線引きするかという閾値そのものが編集判断であり、確認なしに閾値を決め打ちすると、根拠のない評価に見かけ上の権威を与えてしまうため。重み配分・各カテゴリの閾値(例: Average CC ≤5ならA、6〜10ならB…)を具体的に決めたい場合は、別途相談のうえ実装する。
+
 ## 使う上での注意点
 
 - ベンダー取り込みコード(サードパーティのvendoring等)が含まれるディレクトリをそのままスキャンすると、SLOC・人月ともに実態より過大になる。自社開発分だけを見積もりたい場合は、対象サブディレクトリを絞って実行するか、`EXCLUDE_DIRS` の追加を検討すること。
 - Coverageはjacoco.xml/coverage-summary.jsonが見つかった場合のみ算出され、無い場合はN/A。
 - `--productivity` を省略するとビルトインのIPAデフォルトが使われる。企業独自の値を常用したい場合は `sizecheck.sh` に `--productivity productivity.json`(または自社ファイル)を含めておくこと。
+- `--ai`はデフォルトで無効(opt-in)。有効にする場合、ベンダー取り込みリポジトリを含む大きなワークスペースでは `--ai-since` で期間を絞ること(パフォーマンス上の注意を参照)。
+
+## 更新履歴(主な機能追加)
+
+1. **初期版**: SLOC/アーキテクチャ/データ/クラウドネイティブ/複雑度/依存関係を計測し、`weights.json`の重み付けでScoreを算出、Tiny〜Enterpriseに分類。
+2. **人月試算の追加**(`--effort`): IPA表A1-2-4のSLOC規模帯別生産性を使い、Java/Node SLOCから人月を概算。
+3. **生産性テーブルの外部化**(`--productivity`): IPAデフォルトを`productivity.json`に外部化し、企業独自の値に差し替え可能に(`productivity.example.json`も追加)。
+4. **テキストレポートの表示順を変更**: 「詳細→サマリ」だった従来順を「サマリ(Score/人月)→詳細」に統一。
+5. **HTMLレポート追加**(`--html`): 外部ライブラリ・インターネット接続不要のインラインSVGグラフ付き自己完結HTML。サマリ・人月をトップに配置。
+6. **`sizecheck.sh`の外部パラメータ化**: `APP_NAME`/`GENERATE_HTML`/`GENERATE_AI`を引数・環境変数で指定可能に(実行時ヘッダー表示)。
+7. **AI Development追加**(`--ai`): 全`.git`リポジトリを横断してLines Added/Deleted・Refactoring Ratio・AI共著コミット比率をgitから実測。gitで測れない指標(AI生成率・Accept Rate等)は`--ai-metrics FILE`で外部入力(捏造しない)。
+8. **AI Productivity Factor (APF) 追加**: 見積りモデル(Base PM)とAI診断モデルを分離したまま、AIの影響を人月に反映したい場合のみ`ai-metrics.json`の`ai_productivity_factor`(人が判断した数値)をBase PMに乗算。判断根拠(AI生成率・Accept Rate・テスト生成/レビュー/リファクタリング利用の有無)も併記して監査可能にした。

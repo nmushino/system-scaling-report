@@ -10,6 +10,7 @@ a size band (Tiny / Small / Medium / Large / Enterprise).
 Usage:
     python3 software_size.py [PATH] [--name NAME] [--json] [--weights FILE] [--effort]
                               [--productivity FILE] [--html FILE]
+                              [--ai] [--ai-since WHEN] [--ai-metrics FILE]
 
     PATH                Directory to scan (default: current directory)
     --name NAME         Project name shown in the report (default: dir name)
@@ -22,6 +23,20 @@ Usage:
                          productivity.example.json).
     --html FILE          Write a self-contained HTML report (with charts)
                          to this path.
+    --ai                 Add an AI Development section: Lines Added/Deleted,
+                         a refactor-ratio heuristic and an AI-coauthored-
+                         commit ratio, all computed from git log across every
+                         repo found under PATH.
+    --ai-since WHEN      Limit --ai's git history (e.g. "90 days ago").
+                         Recommended for large/vendored histories.
+    --ai-metrics FILE    JSON with externally-measured AI metrics that git
+                         cannot provide (AI Generated SLOC, assistant accept
+                         rate, review/coding time, prompt count, test
+                         generation ratio) -- see ai-metrics.example.json.
+                         Never estimated; omitted from the report if not given.
+                         If the file sets "ai_productivity_factor", it is
+                         applied to Base PM (see Notes) whether or not --ai
+                         is also passed.
 
 Notes:
     - Person-months are estimated from a size-banded SLOC-productivity table
@@ -30,7 +45,21 @@ Notes:
       the same table is applied to Java SLOC and Node SLOC separately by
       default). Pass --productivity to plug in your own company's measured
       rates per language. Treat the result as a rough-order-of-magnitude
-      estimate, not a committed estimate.
+      estimate, not a committed estimate. This is the "Base PM" -- the
+      estimation model, reproducible from SLOC + productivity table alone,
+      meant for contracts/planning.
+    - The estimation model (Base PM) and the AI diagnostic (--ai) are kept
+      deliberately separate: a quality/readiness-style score is never used to
+      adjust PM, because that would make the estimate hard to reproduce or
+      explain ("why 16.8 PM?"). The only way AI affects PM is an explicit,
+      user-supplied "ai_productivity_factor" in --ai-metrics (a plain
+      multiplier: Adjusted PM = Base PM x APF) -- fully deterministic and
+      auditable, and Base PM is always shown alongside it, unchanged.
+    - --ai only reports what's verifiable from git (line churn, a refactor
+      heuristic, and AI-coauthor commit trailers). It does not estimate
+      "AI Generated Code %", "Copilot Accept Rate", "Prompt Count" or
+      "Review Time" -- those need telemetry from your AI coding tool, which
+      you supply via --ai-metrics.
     - Uses `cloc` for SLOC counting when available (accurate comment/blank
       stripping across languages), otherwise falls back to a built-in
       counter.
@@ -460,6 +489,211 @@ def find_coverage(root):
 
 
 # ---------------------------------------------------------------------------
+# AI development metrics (git-derived, opt-in via --ai)
+# ---------------------------------------------------------------------------
+#
+# What's actually measurable from git alone: Lines Added/Deleted (git log
+# --numstat), a refactoring-ratio heuristic, and an AI-coauthored-commit ratio
+# (via "Co-Authored-By: <tool>" trailers, which Claude Code and some other
+# tools add automatically). There is no reliable local signal for "AI
+# Generated SLOC %", "Copilot Accept Rate", "Prompt Count" or "Review Time" --
+# those require telemetry from the AI tool itself (Copilot Metrics API,
+# Cursor analytics, IDE plugin logs). Rather than estimate them, this tool
+# only reports them if supplied via --ai-metrics FILE (see
+# ai-metrics.example.json); otherwise they're shown as not available.
+
+AI_COAUTHOR_PATTERN = re.compile(
+    r"co-authored-by:.*(claude|copilot|codeium|cursor|chatgpt|gpt-|openai|gemini|"
+    r"devin|windsurf|tabnine|codewhisperer|amazon\s*q|jules|replit)",
+    re.IGNORECASE,
+)
+REFACTOR_KEYWORD_PATTERN = re.compile(r"\brefactor\w*\b", re.IGNORECASE)
+
+# Metrics that require external AI-tool telemetry; only populated from
+# --ai-metrics FILE, never estimated.
+EXTERNAL_AI_FIELDS = [
+    ("ai_generated_sloc", "AI Generated SLOC"),
+    ("ai_generated_ratio_pct", "AI Generated Ratio (%)"),
+    ("copilot_accept_rate_pct", "Assistant Accept Rate (%)"),
+    ("estimated_review_hours", "Estimated Review Time (h)"),
+    ("estimated_coding_hours", "Estimated Coding Time (h)"),
+    ("prompt_count", "Prompt Count"),
+    ("test_generation_ratio_pct", "Test Generation Ratio (%)"),
+]
+
+# Supporting context for a human-judged "ai_productivity_factor" -- purely
+# informational (shown next to APF so the number is auditable). The tool
+# never computes APF from these; the value in ai-metrics.json is entered by
+# whoever is best placed to judge it (see README: "入力者の判断にまかせる").
+AI_PRODUCTIVITY_BASIS_FIELDS = [
+    ("ai_generated_ratio_pct", "AI Generated Ratio (%)"),
+    ("copilot_accept_rate_pct", "AI Accept Rate (%)"),
+    ("ai_test_generation_used", "AI Test Generation"),
+    ("ai_review_used", "AI Review Used"),
+    ("ai_refactoring_used", "AI Refactoring Used"),
+]
+
+
+def _fmt_basis_value(value):
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return value
+
+
+def _run_git(repo_dir, args, timeout=90):
+    try:
+        out = subprocess.run(["git", "-C", repo_dir] + args, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def find_git_repo_dirs(root):
+    """Repo roots under `root` (just [root] if root itself is already a repo).
+
+    This tool commonly scans a multi-repo workspace where every subproject
+    has its own .git, so we discover and aggregate across all of them.
+    """
+    if _run_git(root, ["rev-parse", "--is-inside-work-tree"]) is not None:
+        return [root]
+    repo_dirs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".git" in dirnames or ".git" in filenames:
+            repo_dirs.append(dirpath)
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+    return repo_dirs
+
+
+def _parse_git_log(raw):
+    commits = []
+    for chunk in raw.split("\x01"):
+        if not chunk.strip():
+            continue
+        try:
+            commit_hash, rest = chunk.split("\x02", 1)
+            body, numstat_block = rest.split("\x03", 1)
+        except ValueError:
+            continue
+        added = deleted = 0
+        for line in numstat_block.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) < 3 or parts[0] == "-" or parts[1] == "-":
+                continue  # binary file or malformed line
+            added += int(parts[0])
+            deleted += int(parts[1])
+        first_line = body.splitlines()[0] if body.strip() else ""
+        commits.append({
+            "hash": commit_hash.strip(),
+            "added": added,
+            "deleted": deleted,
+            "is_ai_coauthored": bool(AI_COAUTHOR_PATTERN.search(body)),
+            "is_refactor_keyword": bool(REFACTOR_KEYWORD_PATTERN.search(first_line)),
+        })
+    return commits
+
+
+def git_ai_stats(root, since=None):
+    """Aggregate Lines Added/Deleted, refactor ratio and AI-coauthor-commit
+    ratio across every git repo found under `root`. Returns None if no git
+    repo is found under the scanned path.
+    """
+    repo_dirs = find_git_repo_dirs(root)
+    if not repo_dirs:
+        return None
+
+    all_commits = []
+    skipped = 0
+    log_args = ["log", "--no-merges", "--numstat", "--pretty=format:%x01%H%x02%B%x03"]
+    if since:
+        log_args += [f"--since={since}"]
+    for repo_dir in repo_dirs:
+        raw = _run_git(repo_dir, log_args)
+        if raw is None:
+            skipped += 1
+            continue
+        all_commits.extend(_parse_git_log(raw))
+
+    if not all_commits:
+        return {"repo_count": len(repo_dirs), "skipped_repos": skipped, "commit_count": 0}
+
+    total_added = sum(c["added"] for c in all_commits)
+    total_deleted = sum(c["deleted"] for c in all_commits)
+    total_churn = total_added + total_deleted
+    balanced_churn = sum(2 * min(c["added"], c["deleted"]) for c in all_commits)
+    refactor_commits = [c for c in all_commits if c["is_refactor_keyword"]]
+    ai_commits = [c for c in all_commits if c["is_ai_coauthored"]]
+    ai_added = sum(c["added"] for c in ai_commits)
+
+    return {
+        "repo_count": len(repo_dirs),
+        "skipped_repos": skipped,
+        "commit_count": len(all_commits),
+        "lines_added": total_added,
+        "lines_deleted": total_deleted,
+        "net_lines": total_added - total_deleted,
+        "refactor_keyword_commits": len(refactor_commits),
+        "refactor_keyword_ratio_pct": round(len(refactor_commits) / len(all_commits) * 100, 1),
+        "balanced_churn_refactor_ratio_pct": round(balanced_churn / total_churn * 100, 1) if total_churn else 0.0,
+        "ai_coauthored_commits": len(ai_commits),
+        "ai_coauthored_commit_ratio_pct": round(len(ai_commits) / len(all_commits) * 100, 1),
+        "ai_coauthored_lines_added": ai_added,
+        "ai_coauthored_lines_ratio_pct": round(ai_added / total_added * 100, 1) if total_added else 0.0,
+    }
+
+
+def load_external_ai_metrics(path):
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def render_ai_section(git_stats, external_metrics, external_source):
+    lines = []
+    add = lines.append
+    add("")
+    add("AI Development (git-derived + optional external metrics)")
+    add("-" * 60)
+    if git_stats is None:
+        add("No git repository found under the scanned path -- git-derived metrics")
+        add("(Lines Added/Deleted, refactor ratio, AI-coauthor ratio) are unavailable.")
+    elif git_stats.get("commit_count", 0) == 0:
+        note = f" ({git_stats['skipped_repos']} skipped: timeout/error)" if git_stats.get("skipped_repos") else ""
+        add(f"Found {git_stats['repo_count']} git repo(s){note} but no commits matched.")
+    else:
+        skipped_note = f" ({git_stats['skipped_repos']} skipped: timeout/error)" if git_stats.get("skipped_repos") else ""
+        add(f"Repos analyzed    : {git_stats['repo_count']}{skipped_note}")
+        add(f"Commits analyzed  : {git_stats['commit_count']:,}")
+        add(f"Lines Added       : {git_stats['lines_added']:,}")
+        add(f"Lines Deleted     : {git_stats['lines_deleted']:,}")
+        add(f"Net Change        : {git_stats['net_lines']:+,}")
+        add(f"Refactoring Ratio : {git_stats['balanced_churn_refactor_ratio_pct']}% "
+            f"(balanced-churn heuristic: 2*min(added,deleted)/churn per commit)")
+        add(f"                    {git_stats['refactor_keyword_ratio_pct']}% of commits mention "
+            f"\"refactor\" in the message (keyword heuristic)")
+        add(f"AI Co-authored    : {git_stats['ai_coauthored_commit_ratio_pct']}% of commits "
+            f"({git_stats['ai_coauthored_commits']:,}/{git_stats['commit_count']:,}), "
+            f"{git_stats['ai_coauthored_lines_ratio_pct']}% of lines added")
+        add("  * Detected via 'Co-Authored-By: <tool>' commit trailers (Claude, Copilot,")
+        add("    Cursor, etc.). Tools that don't add commit trailers (e.g. plain")
+        add("    autocomplete) are undercounted -- this is a lower bound, not a")
+        add("    precise measurement of AI involvement.")
+    add("")
+    if external_metrics:
+        add(f"External AI metrics (source: {external_source})")
+        for key, label in EXTERNAL_AI_FIELDS:
+            if key in external_metrics and external_metrics[key] is not None:
+                add(f"  {label:<28}: {external_metrics[key]}")
+    else:
+        add("External AI metrics: not provided.")
+        add("  AI Generated SLOC/Ratio, Assistant Accept Rate, Review/Coding Time,")
+        add("  Prompt Count and Test Generation Ratio require telemetry from your AI")
+        add("  coding tool (e.g. GitHub Copilot Metrics API, Cursor analytics) -- pass")
+        add("  --ai-metrics FILE to include them (see ai-metrics.example.json).")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -491,6 +725,24 @@ def compute_effort(metrics, productivity):
     }
 
 
+def apply_ai_productivity_factor(effort, apf, apf_source):
+    """Applies an explicit AI Productivity Factor (APF) multiplier to Base PM.
+
+    APF is a plain, user-supplied number (via --ai-metrics), never derived from
+    a quality/readiness score -- this keeps the estimation model (SLOC ->
+    Base PM, used for contracts/planning) reproducible and explainable:
+    Adjusted PM = Base PM x APF, full stop. The unadjusted Base PM fields are
+    left untouched so both numbers remain visible.
+    """
+    adjusted = dict(effort)
+    adjusted["ai_productivity_factor"] = apf
+    adjusted["ai_productivity_factor_source"] = apf_source
+    adjusted["java_person_months_adjusted"] = round(effort["java_person_months"] * apf, 1)
+    adjusted["node_person_months_adjusted"] = round(effort["node_person_months"] * apf, 1)
+    adjusted["total_person_months_adjusted"] = round(effort["total_person_months"] * apf, 1)
+    return adjusted
+
+
 def classify(score):
     for upper, label in SIZE_BANDS:
         if score < upper:
@@ -519,31 +771,54 @@ def compute_score(metrics, weights):
 # Report rendering
 # ---------------------------------------------------------------------------
 
-def render_effort_section(effort, productivity_source):
-    lines = []
-    add = lines.append
-    add("")
-    add(f"Effort Estimate (productivity: {productivity_source})")
-    add("-" * 60)
-    add(f"Java SLOC       : {effort['java_sloc']:,}  (rate {effort['java_rate']} SLOC/人時) "
-        f"-> {effort['java_person_months']} 人月")
-    add(f"Node SLOC       : {effort['node_sloc']:,}  (TS+JS, rate {effort['node_rate']} SLOC/人時) "
-        f"-> {effort['node_person_months']} 人月")
-    add(f"Total           : {effort['total_person_months']} 人月")
-    add("* Default rates are IPA's overall size-banded median (no official")
-    add("  per-language split exists). Pass --productivity for your own rates.")
-    return "\n".join(lines)
-
-
-def render_report(name, metrics, weights, score, classification):
+def render_report(name, metrics, weights, score, classification, effort=None, productivity_source=None,
+                  ai_external=None):
+    """Renders the text report summary-first: headline Summary, then details."""
     lines = []
     add = lines.append
     add("Software Size Summary")
     add("=" * 21)
     add("")
+    add("Summary")
+    add("-------")
+    add(f"Name           : {name}")
+    add(f"Score          : {score} points -> {classification}")
+    add(f"SLOC           : {metrics['total_sloc']:,}")
+    add(f"Files          : {metrics['files']:,}")
+    add("Size Bands     : Tiny(<100) / Small(100-300) / Medium(300-700) / Large(700-1500) / Enterprise(1500+)")
+    if effort is not None:
+        add("")
+        add(f"Effort Estimate (productivity: {productivity_source})")
+        add(f"  Java SLOC    : {effort['java_sloc']:,}  (rate {effort['java_rate']} SLOC/人時) "
+            f"-> {effort['java_person_months']} 人月")
+        add(f"  Node SLOC    : {effort['node_sloc']:,}  (TS+JS, rate {effort['node_rate']} SLOC/人時) "
+            f"-> {effort['node_person_months']} 人月")
+        add(f"  Total        : {effort['total_person_months']} 人月  <- Base PM (contract/planning figure)")
+        add("  * Default rates are IPA's overall size-banded median (no official")
+        add("    per-language split exists). Pass --productivity for your own rates.")
+        if "ai_productivity_factor" in effort:
+            apf = effort["ai_productivity_factor"]
+            add("")
+            add(f"  APF (AI Productivity Factor): {apf}  (source: {effort['ai_productivity_factor_source']})")
+            add(f"  Estimated PM (AI-adjusted)  : {effort['total_person_months_adjusted']} 人月  "
+                f"(= {effort['total_person_months']} base x {apf})")
+            add(f"    Java: {effort['java_person_months_adjusted']} 人月, "
+                f"Node: {effort['node_person_months_adjusted']} 人月")
+            add("  * APF is a plain user-supplied multiplier, not derived from any quality/")
+            add("    readiness score -- Base PM above is unchanged and remains the number to")
+            add("    use for contracts; this adjusted figure is a separate, explicit estimate.")
+            if ai_external:
+                basis = [(label, ai_external[key]) for key, label in AI_PRODUCTIVITY_BASIS_FIELDS
+                         if key in ai_external and ai_external[key] is not None]
+                if basis:
+                    add("  Basis (judged by whoever set APF, not computed by this tool):")
+                    for label, value in basis:
+                        add(f"    {label:<24}: {_fmt_basis_value(value)}")
+                if ai_external.get("ai_productivity_factor_note"):
+                    add(f"  Note: {ai_external['ai_productivity_factor_note']}")
+    add("")
     add("Project")
     add("-------")
-    add(f"Name            : {name}")
     langs = ", ".join(sorted(metrics["sloc_by_lang"], key=lambda l: -metrics["sloc_by_lang"][l]))
     add(f"Languages       : {langs or 'N/A'}")
     add("")
@@ -589,20 +864,6 @@ def render_report(name, metrics, weights, score, classification):
     add(f"Maven Modules   : {metrics['maven_modules']}")
     add(f"Node Packages   : {metrics['node_packages']}")
     add(f"Container Images: {metrics['container_images']}")
-    add("")
-    add("Overall Size")
-    add("------------")
-    add("Tiny / Small / Medium / Large / Enterprise")
-    add("")
-    add("Software Size Score")
-    add("-" * 20)
-    add(f"{score} points -> {classification}")
-    add("")
-    add("Summary")
-    add("-------")
-    add(f"Score          : {score}")
-    add(f"SLOC           : {metrics['total_sloc']:,}")
-    add(f"ApplicationType: {classification}")
     return "\n".join(lines)
 
 
@@ -685,7 +946,8 @@ def _svg_gauge(score, bands, width=680):
             f'xmlns="http://www.w3.org/2000/svg">{"".join(segments)}</svg>')
 
 
-def render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source):
+def render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source,
+                ai_stats=None, ai_external=None, ai_external_source=None, apf_context=None):
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     badge_colors = {"Tiny": "#60a5fa", "Small": "#3b82f6", "Medium": "#2563eb",
                     "Large": "#f59e0b", "Enterprise": "#ef4444"}
@@ -694,6 +956,33 @@ def render_html(name, metrics, weights, score, classification, breakdown, effort
     sloc_items = sorted(metrics["sloc_by_lang"].items(), key=lambda kv: -kv[1])
     breakdown_items = list(breakdown.items())
     effort_items = [("Java", effort["java_person_months"]), ("Node (TS+JS)", effort["node_person_months"])]
+    apf_block = ""
+    if "ai_productivity_factor" in effort:
+        apf = effort["ai_productivity_factor"]
+        adjusted_items = [("Base PM", effort["total_person_months"]),
+                           ("AI-adjusted PM", effort["total_person_months_adjusted"])]
+        basis_html = ""
+        if apf_context:
+            basis_rows = [(label, _fmt_basis_value(apf_context[key])) for key, label in AI_PRODUCTIVITY_BASIS_FIELDS
+                          if key in apf_context and apf_context[key] is not None]
+            if basis_rows:
+                basis_trs = "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in basis_rows)
+                basis_html += f'<p class="note">Basis (judged by whoever set APF, not computed by this tool):</p><table>{basis_trs}</table>'
+            if apf_context.get("ai_productivity_factor_note"):
+                basis_html += f'<p class="note">Note: {_esc(apf_context["ai_productivity_factor_note"])}</p>'
+        apf_block = f"""
+    <h3>AI Productivity Factor (APF): {apf} (source: {_esc(effort['ai_productivity_factor_source'])})</h3>
+    {_svg_bar_chart(adjusted_items, unit=" 人月", color="#059669")}
+    <p class="note">
+      Estimated PM (AI-adjusted) = {effort['total_person_months']} base &times; {apf} =
+      {effort['total_person_months_adjusted']} 人月 (Java {effort['java_person_months_adjusted']},
+      Node {effort['node_person_months_adjusted']}).<br>
+      APF is a plain user-supplied multiplier, not derived from any quality/readiness score &mdash;
+      Base PM above is unchanged and remains the contract/planning figure; this adjusted figure is
+      a separate, explicit estimate.
+    </p>
+    {basis_html}"""
+    show_ai = ai_stats is not None or ai_external is not None
 
     def stat_card(label, value, sub="", accent=False):
         cls = "card accent" if accent else "card"
@@ -728,6 +1017,58 @@ def render_html(name, metrics, weights, score, classification, breakdown, effort
         ("Maven Modules", metrics["maven_modules"]), ("Node Packages", metrics["node_packages"]),
         ("Container Images", metrics["container_images"]),
     ]
+
+    ai_panel_html = ""
+    if show_ai:
+        if ai_stats and ai_stats.get("commit_count"):
+            churn_items = [("Lines Added", ai_stats["lines_added"]), ("Lines Deleted", ai_stats["lines_deleted"])]
+            coauthor_items = [
+                ("AI Co-authored", ai_stats["ai_coauthored_commits"]),
+                ("Human-only", ai_stats["commit_count"] - ai_stats["ai_coauthored_commits"]),
+            ]
+            git_block = f"""
+            <div class="grid-2">
+              <div>
+                <h3>Lines Added / Deleted ({ai_stats['commit_count']:,} commits, {ai_stats['repo_count']} repo(s))</h3>
+                {_svg_bar_chart(churn_items, unit=" lines", color="#0891b2")}
+              </div>
+              <div>
+                <h3>Commits by Co-authorship</h3>
+                {_svg_bar_chart(coauthor_items, unit=" commits", color="#7c3aed")}
+              </div>
+            </div>
+            <p class="note">
+              Refactoring ratio: {ai_stats['balanced_churn_refactor_ratio_pct']}% (balanced-churn heuristic:
+              2&times;min(added,deleted)/churn per commit) &middot;
+              {ai_stats['refactor_keyword_ratio_pct']}% of commits mention "refactor" in the message.<br>
+              AI co-authored: {ai_stats['ai_coauthored_commit_ratio_pct']}% of commits,
+              {ai_stats['ai_coauthored_lines_ratio_pct']}% of lines added &mdash; detected via
+              "Co-Authored-By: &lt;tool&gt;" commit trailers (Claude, Copilot, Cursor, etc.). Tools that
+              don't add commit trailers (plain autocomplete) are undercounted; treat this as a lower bound,
+              not a precise measurement.
+            </p>"""
+        else:
+            git_block = '<p class="note">No git repository found under the scanned path, or no commits matched.</p>'
+
+        if ai_external:
+            ext_rows = [(label, ai_external[key]) for key, label in EXTERNAL_AI_FIELDS
+                        if key in ai_external and ai_external[key] is not None]
+            ext_block = (table_section(f"External AI Metrics (source: {ai_external_source})", ext_rows)
+                         if ext_rows else "")
+        else:
+            ext_block = ("""<p class="note">
+              External AI metrics not provided. AI Generated SLOC/Ratio, Assistant Accept Rate,
+              Review/Coding Time, Prompt Count and Test Generation Ratio require telemetry from your
+              AI coding tool (e.g. GitHub Copilot Metrics API, Cursor analytics) &mdash; pass
+              --ai-metrics FILE to include them (see ai-metrics.example.json).
+            </p>""")
+
+        ai_panel_html = f"""
+  <div class="panel">
+    <h2>AI Development</h2>
+    {git_block}
+    {ext_block}
+  </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -807,8 +1148,9 @@ def render_html(name, metrics, weights, score, classification, breakdown, effort
       (no official per-language Java/Node split exists) &mdash; pass --productivity to
       plug in your own company's measured rates. Treat as a rough-order-of-magnitude estimate.
     </p>
+    {apf_block}
   </div>
-
+  {ai_panel_html}
   <div class="grid-2">
     {table_section("Architecture", architecture_rows)}
     {table_section("Data", data_rows)}
@@ -893,6 +1235,14 @@ def main():
                          help="Print the Java/Node person-months estimate in the text report")
     parser.add_argument("--productivity", help="JSON file overriding the default person-months productivity table")
     parser.add_argument("--html", help="Write a self-contained HTML report (with charts) to this path")
+    parser.add_argument("--ai", action="store_true",
+                         help="Add an AI Development section (git-derived Lines Added/Deleted, "
+                              "refactor ratio, AI-coauthored-commit ratio, plus --ai-metrics if given)")
+    parser.add_argument("--ai-since", help='Limit git history for --ai, e.g. "90 days ago" '
+                                            "(recommended for large/vendored histories -- full history "
+                                            "on a big repo can take a minute or more)")
+    parser.add_argument("--ai-metrics", help="JSON file with externally-measured AI metrics "
+                                              "(see ai-metrics.example.json); not estimated if omitted")
     args = parser.parse_args()
 
     root = os.path.abspath(args.path)
@@ -913,13 +1263,31 @@ def main():
     classification = classify(score)
     effort = compute_effort(metrics, productivity)
 
-    print(render_report(name, metrics, weights, score, classification))
+    # --ai-metrics is independent of --ai: an explicit AI Productivity Factor
+    # adjusts the estimation model (Base PM -> Adjusted PM) whether or not the
+    # --ai diagnostic section (git-derived churn/refactor/coauthor stats) is
+    # requested. The two are kept deliberately separate -- see README.
+    ai_external = load_external_ai_metrics(args.ai_metrics)
+    if ai_external and ai_external.get("ai_productivity_factor") is not None:
+        effort = apply_ai_productivity_factor(effort, ai_external["ai_productivity_factor"], args.ai_metrics)
 
-    if args.effort:
-        print(render_effort_section(effort, productivity_source))
+    print(render_report(name, metrics, weights, score, classification,
+                        effort if args.effort else None, productivity_source, ai_external))
+
+    ai_stats = None
+    if args.ai:
+        ai_stats = git_ai_stats(root, since=args.ai_since)
+        print(render_ai_section(ai_stats, ai_external, args.ai_metrics))
 
     if args.html:
-        html = render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source)
+        # The AI Development panel (git churn/refactor/coauthor stats) only
+        # shows when --ai was requested; an APF-only run (--ai-metrics without
+        # --ai) still adjusts the Effort panel above via `effort` itself.
+        html = render_html(name, metrics, weights, score, classification, breakdown, effort, productivity_source,
+                            ai_stats=ai_stats if args.ai else None,
+                            ai_external=ai_external if args.ai else None,
+                            ai_external_source=args.ai_metrics,
+                            apf_context=ai_external)
         with open(args.html, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"\nHTML report written to {args.html}")
@@ -930,6 +1298,7 @@ def main():
             "name": name, "metrics": metrics, "weights": weights,
             "breakdown": breakdown, "score": score, "classification": classification,
             "effort": effort,
+            "ai": {"git_stats": ai_stats, "external_metrics": ai_external} if (args.ai or ai_external) else None,
         }, indent=2, default=str))
 
 
